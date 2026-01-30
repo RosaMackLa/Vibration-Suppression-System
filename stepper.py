@@ -5,7 +5,8 @@ import time
 # Pin definitions (BCM)
 # ----------------------
 STEP_PIN = 6
-DIR_PIN = 7
+DIR_PIN = 7 #The funny number
+
 
 step_pin = OutputDevice(STEP_PIN)
 dir_pin = OutputDevice(DIR_PIN)
