@@ -2,16 +2,12 @@ from gpiozero import OutputDevice, Button
 import time
 
 # GPIO pins (BCM numbering)
-HIGH_PIN = 6
 BUTTON_PIN = 17
 
 # Set up pins
-high_pin = OutputDevice(HIGH_PIN)
 button = Button(BUTTON_PIN, pull_up=False)
 
 # Drive constant HIGH
-high_pin.on()
-
 print("Press the button. CTRL+C to exit.")
 
 try:
@@ -23,5 +19,4 @@ try:
         time.sleep(0.3)
 
 except KeyboardInterrupt:
-    high_pin.off()
     print("Test ended.")

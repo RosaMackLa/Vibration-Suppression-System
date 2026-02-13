@@ -5,8 +5,7 @@ import time
 # Pin definitions (BCM)
 # ----------------------
 STEP_PIN = 6
-DIR_PIN = 7 #The funny number
-
+DIR_PIN = 16
 
 step_pin = OutputDevice(STEP_PIN)
 dir_pin = OutputDevice(DIR_PIN)
@@ -46,8 +45,8 @@ def move_to(target_steps):
 
 print("Enter angle (0–360 degrees):")
 
-while True:
-    try:
+try:
+    while True:
         target_angle = float(input("> "))
 
         if 0 <= target_angle <= 360:
@@ -57,7 +56,13 @@ while True:
         else:
             print("Invalid angle. Enter 0–360 only.")
 
-    except KeyboardInterrupt:
-        break
-    except:
-        print("Invalid input.")
+except KeyboardInterrupt:
+    pass
+
+finally:
+    step_pin.off()
+    dir_pin.off()
+    step_pin.close()
+    dir_pin.close()
+    print("GPIO released.")
+

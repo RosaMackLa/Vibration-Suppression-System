@@ -21,5 +21,10 @@ def test_level_shifter(gpio_pin=6, interval=1.0):
         pin.off()
         print("Test stopped.")
 
+    finally:
+        pin.off()
+        pin.close()
+        print("GPIO released.")
+
 # ---- Run test ----
 test_level_shifter(gpio_pin=6, interval=3.0)
