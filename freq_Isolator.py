@@ -2,6 +2,9 @@
 import argparse
 import time
 import math
+import busio
+import board
+from adafruit_lsm6ds.lsm6dso32 import LSM6DSO32
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -14,13 +17,16 @@ class Peak:
     amp: float
     rel_amp: float
 
+i2c = busio.I2C(board.SCL, board.SDA)
+imu = LSM6DSO32(i2c)
 
-def read_accel_sample_placeholder() -> float:
+def read_accel_sample() -> float:
     """
-    REPLACE THIS with your real accelerometer read.
     Return ONE scalar acceleration sample (e.g., magnitude, or a single axis) in m/s^2.
     """
-    raise NotImplementedError("Replace read_accel_sample_placeholder() with your IMU read.")
+    ax, ay, az = imu.acceleration
+
+    return ax
 
 
 def read_accel_sample_simulated(t: float) -> float:
@@ -55,6 +61,7 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
     t0 = time.perf_counter()
     next_t = t0
 
+
     for i in range(n_target):
         now = time.perf_counter()
         # busy-wait just enough to hit the cadence (simple, predictable; can be improved later)
@@ -62,11 +69,21 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
             time.sleep(max(0.0, next_t - now))
         now = time.perf_counter()
 
-        t = now - t0
-        if simulate:
-            samples[i] = read_accel_sample_simulated(t)
-        else:
-            samples[i] = read_accel_sample_placeholder()
+        t_before_read = time.perf_counter()
+        val = read_accel_sample()
+        t_after_read = time.perf_counter()
+
+        if i % 100 == 0:
+            print(f"i={i}  t={t_after_read - t0:.3f}s  read_dt={(t_after_read - t_before_read)*1000:.2f} ms")
+
+        samples[i] = val
+
+        #t = now - t0
+        #if simulate:
+        #    samples[i] = read_accel_sample_simulated(t)
+        #else:
+        #    samples[i] = read_accel_sample()
+        #    print(f"Accel X: {samples[i]}, Time: {t}")
 
         t_stamps[i] = now
         next_t += period
