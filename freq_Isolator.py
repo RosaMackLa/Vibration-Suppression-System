@@ -64,26 +64,25 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
 
     for i in range(n_target):
         now = time.perf_counter()
-        # busy-wait just enough to hit the cadence (simple, predictable; can be improved later)
+
         if now < next_t:
-            time.sleep(max(0.0, next_t - now))
-        now = time.perf_counter()
+            time.sleep(next_t - now)
+            now = time.perf_counter()
+
+        t = now - t0
 
         t_before_read = time.perf_counter()
-        val = read_accel_sample()
+        if simulate:
+            val = read_accel_sample_simulated(t)
+        else:
+            val = read_accel_sample()
         t_after_read = time.perf_counter()
-
-        if i % 100 == 0:
-            print(f"i={i}  t={t_after_read - t0:.3f}s  read_dt={(t_after_read - t_before_read)*1000:.2f} ms")
 
         samples[i] = val
 
-        #t = now - t0
-        #if simulate:
-        #    samples[i] = read_accel_sample_simulated(t)
-        #else:
-        #    samples[i] = read_accel_sample()
-        #    print(f"Accel X: {samples[i]}, Time: {t}")
+        if i % 100 == 0:
+            read_dt_ms = (t_after_read - t_before_read) * 1000
+            print(f"i={i}  t={t:.3f}s  read_dt={read_dt_ms:.2f} ms")
 
         t_stamps[i] = now
         next_t += period
