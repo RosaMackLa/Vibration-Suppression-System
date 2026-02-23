@@ -4,7 +4,7 @@ import pigpio
 
 # ---- Hardware constants (your setup) ----
 PULLEY_D_MM = 10.9
-PULSES_PER_REV = 3200
+PULSES_PER_REV = 800
 TRAVEL_TOTAL_MM = 150.0           # total safe travel
 HALF_TRAVEL_MM = TRAVEL_TOTAL_MM/2
 
