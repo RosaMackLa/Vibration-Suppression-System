@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
+
 import argparse
-import math
 import subprocess
 import sys
 import time
-
 import numpy as np
 
-# Import your existing frequency ID code
 import freq_Isolator as fi
 
 
@@ -15,26 +13,49 @@ def parse_args():
     p = argparse.ArgumentParser("VSS Master: identify top 3 freqs, then drive 3-tone stepper command")
 
     # Identification
-    p.add_argument("--id_duration", type=float, default=10.0, help="Seconds of accel data to collect for identification")
-    p.add_argument("--id_fs", type=float, default=800.0, help="Target sampling rate during identification (Hz)")
-    p.add_argument("--fmin", type=float, default=5.0, help="Min frequency to consider (Hz)")
-    p.add_argument("--fmax", type=float, default=400.0, help="Max frequency to consider (Hz)")
-    p.add_argument("--simulate", action="store_true", help="Use simulated accel in freq_Isolator")
+    p.add_argument("--id_duration", type=float, default=10.0,
+                   help="Seconds of accel data to collect for identification")
+    p.add_argument("--id_fs", type=float, default=800.0,
+                   help="Target sampling rate during identification (Hz)")
+    p.add_argument("--fmin", type=float, default=5.0,
+                   help="Min frequency to consider (Hz)")
+    p.add_argument("--fmax", type=float, default=400.0,
+                   help="Max frequency to consider (Hz)")
+    p.add_argument("--simulate", action="store_true",
+                   help="Use simulated accel in freq_Isolator")
 
     # Mapping accel -> motion
-    p.add_argument("--total_amp_mm", type=float, default=10.0,
-                   help="Total displacement budget (mm peak) to distribute across 3 tones")
-    p.add_argument("--amp_floor", type=float, default=0.05,
-                   help="If a rel_amp is below this, clamp it up (prevents zeroing a tone)")
+    p.add_argument("--total_amp_mm", type=float, default=2.0,
+                   help="Total displacement budget (mm peak) to distribute across 3 tones (before max_sps scaling)")
+    p.add_argument("--amp_floor", type=float, default=0.01,
+                   help="Floor on relative amplitudes before normalization (prevents near-zero tone from disappearing)")
+    p.add_argument("--sps_margin", type=float, default=0.9,
+                   help="Safety margin: scale so estimated peak_sps <= margin*max_sps")
+    p.add_argument("--weight_mode", choices=["rel", "rel_over_f", "rel_over_f2"], default="rel_over_f",
+                   help="How to distribute displacement across tones before scaling to max_sps")
 
-    # Stepper execution (passed through to functionStepper.py)
+    # Mechanics for step reate prediction
+    p.add_argument("--steps_per_mm", type=float, default=None,
+                   help="Direct steps/mm conversion for your axis (overrides motor/microsteps/mm_per_rev)")
+    p.add_argument("--motor_steps", type=int, default=200,
+                   help="Full steps per rev of motor (usually 200)")
+    p.add_argument("--microsteps", type=int, default=16,
+                   help="Microsteps setting on the driver (e.g., 16)")
+    p.add_argument("--mm_per_rev", type=float, default=8.0,
+                   help="Axis travel per motor revolution (lead screw lead, or pulley travel per rev)")
+
+    # Stepper execution
     p.add_argument("--step_pin", type=int, default=6, help="BCM STEP pin")
     p.add_argument("--dir_pin", type=int, default=16, help="BCM DIR pin")
     p.add_argument("--dir_invert", action="store_true", help="Invert DIR polarity")
-    p.add_argument("--traj_rate", type=float, default=2000.0, help="Trajectory sample rate for wave generation (Hz)")
-    p.add_argument("--run_dur", type=float, default=15.0, help="How long to run the 3-tone command (s). 0=forever")
-    p.add_argument("--max_sps", type=float, default=8000.0, help="Max steps/s clamp")
-    p.add_argument("--pulse_us", type=int, default=8, help="STEP high pulse width (us)")
+    p.add_argument("--traj_rate", type=float, default=2000.0,
+                   help="Trajectory sample rate for wave generation (Hz)")
+    p.add_argument("--run_dur", type=float, default=15.0,
+                   help="How long to run the 3-tone command (s). 0=forever")
+    p.add_argument("--max_sps", type=float, default=8000.0,
+                   help="Max steps/s clamp (software safety)")
+    p.add_argument("--pulse_us", type=int, default=8,
+                   help="STEP high pulse width (us)")
 
     # Looping
     p.add_argument("--loop", action="store_true", help="Repeat identify->run forever")
@@ -43,15 +64,57 @@ def parse_args():
     return p.parse_args()
 
 
-def relamps_to_mm(rel_amps, total_amp_mm, amp_floor):
-    w = np.array(rel_amps, dtype=float)
-    w = np.maximum(w, amp_floor)
+def get_steps_per_mm(args) -> float:
+    if args.steps_per_mm is not None:
+        return float(args.steps_per_mm)
+    steps_per_rev = args.motor_steps * args.microsteps
+    return float(steps_per_rev / args.mm_per_rev)
+
+
+def estimate_peak_sps(f_hz, a_mm, steps_per_mm) -> float:
+    f = np.array(f_hz, dtype=float)
+    A = np.array(a_mm, dtype=float)
+    peak_mm_per_s = float(np.sum(2.0 * np.pi * f * A))
+    return peak_mm_per_s * float(steps_per_mm)
+
+
+def relamps_to_mm(rel_amps, f_hz, total_amp_mm, steps_per_mm, max_sps,
+                  amp_floor=0.01, margin=0.9, weight_mode="rel_over_f"):
+    """
+    1) Allocate displacement across tones using rel_amps and frequency-aware weighting
+    2) Predict conservative peak step rate bound
+    3) Scale all amplitudes down uniformly to satisfy max_sps with a margin
+    """
+    rel = np.array(rel_amps, dtype=float)
+    f = np.array(f_hz, dtype=float)
+
+    rel = np.maximum(rel, amp_floor)
+    f_safe = np.maximum(f, 1e-6)
+
+    if weight_mode == "rel":
+        w = rel
+    elif weight_mode == "rel_over_f":
+        w = rel / f_safe
+    elif weight_mode == "rel_over_f2":
+        w = rel / (f_safe ** 2)
+    else:
+        w = rel / f_safe
+
     w = w / np.sum(w)
-    return (total_amp_mm * w).tolist()
+    A = total_amp_mm * w
+
+    est = estimate_peak_sps(f_hz, A.tolist(), steps_per_mm)
+
+    scale = 1.0
+    limit = margin * max_sps
+    if est > limit and est > 0:
+        scale = limit / est
+        A = A * scale
+
+    return A.tolist(), est, scale
 
 
 def run_function_stepper(args, f_hz, a_mm):
-    # For now: phases = 0. Later: estimate phase with least-squares and pass phi_k.
     cmd = [
         sys.executable, "functionStepper.py",
         "--step", str(args.step_pin),
@@ -70,10 +133,9 @@ def run_function_stepper(args, f_hz, a_mm):
 
     print("\nLaunching stepper command:")
     print("  freqs (Hz):", [round(x, 3) for x in f_hz])
-    print("  amps  (mm):", [round(x, 3) for x in a_mm])
+    print("  amps  (mm):", [round(x, 4) for x in a_mm])
     print("  cmd:", " ".join(cmd), "\n")
 
-    # Run and stream output live
     subprocess.run(cmd, check=False)
 
 
@@ -92,7 +154,6 @@ def identify_top3(args):
     if len(peaks) < 1:
         raise RuntimeError("No peaks found in band. Increase duration, widen band, or check sensor signal.")
 
-    # Ensure we always have 3 tones (pad with the strongest peak if fewer found)
     while len(peaks) < 3:
         peaks.append(peaks[-1])
 
@@ -103,14 +164,34 @@ def identify_top3(args):
 
 def main():
     args = parse_args()
+    steps_per_mm = get_steps_per_mm(args)
+
+    print(f"Mechanics: steps_per_mm={steps_per_mm:.3f} "
+          f"(motor_steps={args.motor_steps}, microsteps={args.microsteps}, mm_per_rev={args.mm_per_rev})")
+    print(f"Amplitude policy: weight_mode={args.weight_mode}, total_amp_mm={args.total_amp_mm}, "
+          f"max_sps={args.max_sps}, margin={args.sps_margin}")
 
     while True:
         fs_meas, f_hz, rel = identify_top3(args)
-        a_mm = relamps_to_mm(rel, args.total_amp_mm, args.amp_floor)
+
+        a_mm, est_peak_sps_pre_scale, scale = relamps_to_mm(
+            rel_amps=rel,
+            f_hz=f_hz,
+            total_amp_mm=args.total_amp_mm,
+            steps_per_mm=steps_per_mm,
+            max_sps=args.max_sps,
+            amp_floor=args.amp_floor,
+            margin=args.sps_margin,
+            weight_mode=args.weight_mode,
+        )
+
+        est_peak_sps_post = estimate_peak_sps(f_hz, a_mm, steps_per_mm)
 
         print(f"\nID results: fs_meas={fs_meas:.2f} Hz | band=[{args.fmin},{args.fmax}] Hz")
         for i in range(3):
-            print(f"  {i+1}) f={f_hz[i]:8.3f} Hz | rel_amp={rel[i]:.3f} | cmd_amp={a_mm[i]:.3f} mm")
+            print(f"  {i+1}) f={f_hz[i]:8.3f} Hz | rel_amp={rel[i]:.4f} | cmd_amp={a_mm[i]:.4f} mm")
+        print(f"Step-rate estimate: pre_scale≈{est_peak_sps_pre_scale:.1f} sps | "
+              f"scale={scale:.3f} | post_scale≈{est_peak_sps_post:.1f} sps")
 
         run_function_stepper(args, f_hz, a_mm)
 
