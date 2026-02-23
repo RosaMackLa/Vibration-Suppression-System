@@ -1,14 +1,22 @@
 from gpiozero import OutputDevice
 import time
+import pigpio
 
 # ----------------------
 # Pin definitions (BCM)
 # ----------------------
 STEP_PIN = 6
 DIR_PIN = 16
+ENA_PIN = 25
 
 step_pin = OutputDevice(STEP_PIN)
 dir_pin = OutputDevice(DIR_PIN)
+ena_pin = OutputDevice(ENA_PIN)
+
+pi = pigpio.pi()
+
+pi.set_mode(ENA_PIN, pigpio.OUTPUT)
+pi.write(ENA_PIN, 1)
 
 # ----------------------
 # Motor settings
@@ -64,5 +72,7 @@ finally:
     dir_pin.off()
     step_pin.close()
     dir_pin.close()
+    pi.write(ENA_PIN, 0)
+    pi.stop
     print("GPIO released.")
 
