@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 import numpy as np
-
+import math
 import freq_Isolator as fi
 
 
@@ -35,14 +35,10 @@ def parse_args():
                    help="How to distribute displacement across tones before scaling to max_sps")
 
     # Mechanics for step reate prediction
-    p.add_argument("--steps_per_mm", type=float, default=None,
-                   help="Direct steps/mm conversion for your axis (overrides motor/microsteps/mm_per_rev)")
-    p.add_argument("--motor_steps", type=int, default=200,
-                   help="Full steps per rev of motor (usually 200)")
-    p.add_argument("--microsteps", type=int, default=16,
-                   help="Microsteps setting on the driver (e.g., 16)")
-    p.add_argument("--mm_per_rev", type=float, default=8.0,
-                   help="Axis travel per motor revolution (lead screw lead, or pulley travel per rev)")
+    p.add_argument("--pulley_d_mm", type=float, default=10.9,
+                   help="Pulley diameter in mm")
+    p.add_argument("--pulses_per_rev", type=float, default=800.0,
+                   help="Driver pulses per motor rev (matches DM556 DIP)")
 
     # Stepper execution
     p.add_argument("--step_pin", type=int, default=6, help="BCM STEP pin")
@@ -63,13 +59,9 @@ def parse_args():
 
     return p.parse_args()
 
-
 def get_steps_per_mm(args) -> float:
-    if args.steps_per_mm is not None:
-        return float(args.steps_per_mm)
-    steps_per_rev = args.motor_steps * args.microsteps
-    return float(steps_per_rev / args.mm_per_rev)
-
+    mm_per_rev = math.pi * args.pulley_d_mm
+    return float(args.pulses_per_rev / mm_per_rev)
 
 def estimate_peak_sps(f_hz, a_mm, steps_per_mm) -> float:
     f = np.array(f_hz, dtype=float)
@@ -166,8 +158,10 @@ def main():
     args = parse_args()
     steps_per_mm = get_steps_per_mm(args)
 
-    print(f"Mechanics: steps_per_mm={steps_per_mm:.3f} "
-          f"(motor_steps={args.motor_steps}, microsteps={args.microsteps}, mm_per_rev={args.mm_per_rev})")
+    mm_per_rev = math.pi * args.pulley_d_mm
+    print(f"Mechanics: pulses_per_rev={args.pulses_per_rev} | pulley_d_mm={args.pulley_d_mm} "
+          f"| mm_per_rev={mm_per_rev:.3f} | steps_per_mm={steps_per_mm:.3f}")
+
     print(f"Amplitude policy: weight_mode={args.weight_mode}, total_amp_mm={args.total_amp_mm}, "
           f"max_sps={args.max_sps}, margin={args.sps_margin}")
 

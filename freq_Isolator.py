@@ -17,15 +17,21 @@ class Peak:
     amp: float
     rel_amp: float
 
-i2c = busio.I2C(board.SCL, board.SDA)
-imu = LSM6DSO32(i2c)
+_imu = None
+
+def get_imu():
+    global _imu
+    if _imu is None:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        _imu = LSM6DSO32(i2c)
+    return _imu
 
 def read_accel_sample() -> float:
     """
-    Return ONE scalar acceleration sample (e.g., magnitude, or a single axis) in m/s^2.
+    Returns scalar acceleration sample from x-axis in m/s^2.
     """
+    imu = get_imu()
     ax, ay, az = imu.acceleration
-
     return ax
 
 
