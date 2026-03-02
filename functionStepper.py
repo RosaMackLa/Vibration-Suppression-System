@@ -232,10 +232,11 @@ def main():
             sign = 1.0 if phys_dir == 1 else -1.0
             s_est += sign * steps_delivered
             x_est = s_est / k
-            if abs(x_est) > HALF_TRAVEL_MM + 1.0:
-                raise RuntimeError(
-                    f"Travel safety trip: estimated x={x_est:.2f} mm exceeds ±{HALF_TRAVEL_MM:.2f} mm."
-                )
+            if (not args.no_travel_safety) and (not const_mode):
+                if abs(x_est) > HALF_TRAVEL_MM + 1.0:
+                    raise RuntimeError(
+                        f"Travel safety trip: estimated x={x_est:.2f} mm exceeds ±{HALF_TRAVEL_MM:.2f} mm."
+                    )
 
             # Status print
             if next_status is not None and now >= next_status:
