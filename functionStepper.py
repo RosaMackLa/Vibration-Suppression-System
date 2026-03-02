@@ -57,6 +57,8 @@ def parse_args():
     p.add_argument("--const_sps", type=float, default=0.0, help="If >0, run constant step rate (steps/sec)")
     p.add_argument("--const_dir", type=int, default=1, help="Direction for const_sps mode (0 or 1)")
 
+    p.add_argument("--no_travel_safety", action="store_true", help="Disable travel safety bound (use carefully)")
+
     return p.parse_args()
 
 def main():
@@ -75,9 +77,11 @@ def main():
     PHI = [math.radians(args.phi1), math.radians(args.phi2), math.radians(args.phi3)]
 
     # Travel safety: worst-case displacement is sum |Ai|
-    sumA = sum(abs(x) for x in A)
-    if sumA > HALF_TRAVEL_MM + 1e-9:
-        raise SystemExit(f"ERROR: sum(|Ai|)={sumA:.3f} mm exceeds half-travel {HALF_TRAVEL_MM:.3f} mm.")
+    if (not args.no_travel_safety) and (not const_mode):
+        if abs(x_est) > HALF_TRAVEL_MM + 1.0:
+            raise RuntimeError(
+                f"Travel safety trip: estimated x={x_est:.2f} mm exceeds ±{HALF_TRAVEL_MM:.2f} mm."
+            )
 
     # Conservative peak velocity bound: vmax <= Σ |Ai| * 2πfi
     vmax_mm_s = 0.0
