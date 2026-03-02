@@ -171,7 +171,6 @@ def main():
                 sps_cmd = float(const_freq)
                 logical_dir = const_dir
             else:
-
                 # Desired velocity v(t) = d/dt Σ Ai sin(2πfi t + phii)
                 v_mm_s = 0.0
                 for i in range(3):
@@ -180,20 +179,20 @@ def main():
                     w = 2.0 * math.pi * F[i]
                     v_mm_s += A[i] * w * math.cos(w * t + PHI[i])
 
+                # Direction from velocity sign
+                logical_dir = 1 if v_mm_s >= 0.0 else 0
+                logical_dir ^= dir_invert
+
                 # Command step rate magnitude
                 sps_cmd = abs(v_mm_s) * k
                 if sps_cmd < args.deadband_sps:
                     sps_cmd = 0.0
                 sps_cmd = clamp(sps_cmd, 0.0, args.max_sps)
 
-                # Slew limit (prevents sudden sps jumps)
-                dsps_max = max(0.0, args.slew_sps_per_s) * dt
-                sps = clamp(sps_cmd, sps_prev - dsps_max, sps_prev + dsps_max)
-                sps_prev = sps
-
-                # Direction from velocity sign
-                logical_dir = 1 if v_mm_s >= 0.0 else 0
-                logical_dir ^= dir_invert
+            # Slew limit (prevents sudden sps jumps) — applies to both modes
+            dsps_max = max(0.0, args.slew_sps_per_s) * dt
+            sps = clamp(sps_cmd, sps_prev - dsps_max, sps_prev + dsps_max)
+            sps_prev = sps
 
             # Handle DIR flips without inserting a full dt pause
             if last_dir is None:
