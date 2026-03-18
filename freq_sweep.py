@@ -25,7 +25,7 @@ def steps_per_mm():
 
 def parse_args():
     p = argparse.ArgumentParser("VSS frequency sweep (chirp)")
-    p.add_argument("--step", type=int, default=18)
+    p.add_argument("--step", type=int, default=13)
     p.add_argument("--dir", type=int, default=16)
     p.add_argument("--dir_invert", action="store_true")
 

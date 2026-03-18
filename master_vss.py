@@ -35,13 +35,13 @@ def parse_args():
                    help="How to distribute displacement across tones before scaling to max_sps")
 
     # Mechanics for step reate prediction
-    p.add_argument("--pulley_d_mm", type=float, default=10.9,
+    p.add_argument("--pulley_d_mm", type=float, default=11.84,
                    help="Pulley diameter in mm")
-    p.add_argument("--pulses_per_rev", type=float, default=800.0,
+    p.add_argument("--pulses_per_rev", type=float, default=3200.0,
                    help="Driver pulses per motor rev (matches DM556 DIP)")
 
     # Stepper execution
-    p.add_argument("--step_pin", type=int, default=6, help="BCM STEP pin")
+    p.add_argument("--step_pin", type=int, default=13, help="BCM STEP pin")
     p.add_argument("--dir_pin", type=int, default=16, help="BCM DIR pin")
     p.add_argument("--dir_invert", action="store_true", help="Invert DIR polarity")
     p.add_argument("--traj_rate", type=float, default=2000.0,
