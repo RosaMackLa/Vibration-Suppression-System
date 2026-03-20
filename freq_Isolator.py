@@ -10,6 +10,12 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 
+# ── matplotlib setup ──────────────────────────────────────────────────────────
+# Must set backend BEFORE importing pyplot, so the import is deferred to
+# plot_results() and the backend is set right beforehand.  This keeps the
+# rest of the module importable on a headless Pi even without a display.
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class Peak:
@@ -197,6 +203,73 @@ def pick_top_peaks(
     return peaks
 
 
+def plot_results(
+    samples: np.ndarray,
+    fs_meas: float,
+    freqs: np.ndarray,
+    amps: np.ndarray,
+    peaks: List[Peak],
+    out_path: str,
+    min_freq_hz: float,
+    max_freq_hz: Optional[float],
+) -> None:
+    """
+    Save a two-panel figure:
+      Top:    raw acceleration time series
+      Bottom: single-sided FFT amplitude spectrum with peak markers
+
+    Uses the Agg (file-only) backend so this works on a headless Pi.
+    """
+    import matplotlib
+    matplotlib.use("Agg")           # must be set before importing pyplot
+    import matplotlib.pyplot as plt
+
+    t_axis = np.arange(len(samples)) / fs_meas   # time vector in seconds
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7))
+    fig.suptitle("VSS — Accelerometer Capture & FFT", fontweight="bold")
+
+    # ── Panel 1: time series ──────────────────────────────────────────────────
+    ax_t = axes[0]
+    ax_t.plot(t_axis, samples, linewidth=0.6, color="steelblue")
+    ax_t.set_xlabel("Time (s)")
+    ax_t.set_ylabel("Acceleration (m/s²)")
+    ax_t.set_title("Raw Acceleration Time Series")
+    ax_t.grid(True, linestyle="--", alpha=0.5)
+
+    # ── Panel 2: FFT spectrum ─────────────────────────────────────────────────
+    ax_f = axes[1]
+
+    # Optionally restrict the x-axis to the analysis band for clarity
+    freq_lo = min_freq_hz
+    freq_hi = max_freq_hz if max_freq_hz is not None else freqs[-1]
+    band_mask = (freqs >= freq_lo) & (freqs <= freq_hi)
+
+    ax_f.plot(freqs[band_mask], amps[band_mask], linewidth=0.8, color="darkorange")
+    ax_f.set_xlabel("Frequency (Hz)")
+    ax_f.set_ylabel("Amplitude (m/s²)")
+    ax_f.set_title("Single-Sided FFT Amplitude Spectrum")
+    ax_f.grid(True, linestyle="--", alpha=0.5)
+
+    # Mark detected peaks
+    for p in peaks:
+        ax_f.axvline(p.freq_hz, color="crimson", linewidth=0.8, linestyle="--", alpha=0.7)
+        ax_f.annotate(
+            f"{p.freq_hz:.1f} Hz\n{p.amp:.3g}",
+            xy=(p.freq_hz, p.amp),
+            xytext=(6, 6),
+            textcoords="offset points",
+            fontsize=7,
+            color="crimson",
+        )
+        ax_f.scatter([p.freq_hz], [p.amp], color="crimson", s=30, zorder=5)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Plot saved to: {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Collect accel data, FFT, report top dominant frequencies.")
     ap.add_argument("--duration", type=float, default=30.0, help="seconds to record (default 30)")
@@ -207,6 +280,9 @@ def main():
     ap.add_argument("--window", type=str, default="hann", choices=["hann", "rect"], help="FFT window")
     ap.add_argument("--simulate", action="store_true", help="use simulated accel instead of hardware")
     ap.add_argument("--save-spectrum", type=str, default=None, help="path to save spectrum CSV (freq, amp)")
+    ap.add_argument("--plot", action="store_true", help="save a two-panel plot (time series + FFT spectrum)")
+    ap.add_argument("--plot-out", type=str, default="spectrum_plot.png",
+                    help="output path for the plot image (default: spectrum_plot.png)")
     args = ap.parse_args()
 
     x, fs_meas = collect_time_series(args.duration, args.fs, args.simulate)
@@ -239,6 +315,18 @@ def main():
         np.savetxt(args.save_spectrum, data, delimiter=",", header="freq_hz,amp", comments="")
         print()
         print(f"Saved spectrum CSV to: {args.save_spectrum}")
+
+    if args.plot:
+        plot_results(
+            samples=x,
+            fs_meas=fs_meas,
+            freqs=freqs,
+            amps=amps,
+            peaks=peaks,
+            out_path=args.plot_out,
+            min_freq_hz=args.min_freq,
+            max_freq_hz=args.max_freq,
+        )
 
 
 if __name__ == "__main__":
