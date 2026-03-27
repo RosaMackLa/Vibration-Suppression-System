@@ -6,48 +6,50 @@ PIPELINE
 ────────
   PHASE 1 — IDENTIFY : sample IMU for --id_dur seconds, FFT, pick top ≤N tones
   PHASE 2 — CANCEL   : DMA waveform stepper at identified frequencies;
-                        LMS thread continuously adapts (C, S) coefficients
+                        LMS thread continuously adapts (C, S, ω) coefficients
                         to minimise residual IMU acceleration
 
 CONTROL LAW (per tone i, ωᵢ = 2πfᵢ)
 ──────────────────────────────────────
-  Cancellation signal : x(t) = Σ [Cᵢ·cos(ωᵢt) + Sᵢ·sin(ωᵢt)]   [mm]
-  Error               : e(t) = IMU x-axis acceleration              [m/s²]
-  LMS update          : Cᵢ  -= µ · e(t) · cos(ωᵢt)
-                        Sᵢ  -= µ · e(t) · sin(ωᵢt)
+  Cancellation signal : x(t) = Σ [Cᵢ·cos(φᵢ) + Sᵢ·sin(φᵢ)]   [mm]
+                        where φᵢ is a continuously accumulated phase
+  Error               : e(t) = IMU x-axis acceleration            [m/s²]
+  LMS updates         : Cᵢ  -= µ      · e(t) · cos(φᵢ)
+                        Sᵢ  -= µ      · e(t) · sin(φᵢ)
+                        ωᵢ  -= µ_omega · e(t) · (Sᵢ·cos(φᵢ) − Cᵢ·sin(φᵢ))
 
-  Convergence: when the projections of e onto both basis functions reach zero
-  the residual is orthogonal to each reference → LMS minimum MSE attained.
-  The (C, S) basis jointly covers any amplitude and phase without explicit
-  phase estimation; the loop self-corrects for plant phase shifts.
+  The ω update uses the quadrature signal (S·cos − C·sin), which is the
+  component of x(t) that is 90° ahead of the current output and points in
+  the direction of increasing frequency.  This is an approximation of
+  ∂x/∂ω that drops the growing t factor, absorbed into µ_omega instead.
+
+  A phase accumulator (φᵢ += ωᵢ·dt each sample) replaces ωᵢ·t so that
+  when ω changes the phase evolves continuously with no discontinuity.
+
+  µ_omega must be much smaller than µ: frequency is a global parameter
+  and wrong updates corrupt both C and S simultaneously.  Start at µ·0.01.
 
 ARCHITECTURE
 ────────────
-  Main thread   : DMA double-buffer loop (adapted from functionStepper_wave.py)
-                  reads latest LMS coefficients at every chunk boundary
+  Main thread   : DMA double-buffer loop — reads latest (C, S, ω) at every
+                  chunk boundary and passes adapted frequency to compute_chunk
   LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp
-  Status thread : ~status_hz Hz print + pigpiod keepalive
-
-SIMULATION MODE (--simulate)
-──────────────────────────────
-  A simple plant model replaces the hardware IMU:
-    e(t) = disturbance(t) + plant_gain × Σ xᵢ(t)
-  where plant_gain converts mm of counterweight travel to m/s² at the IMU.
-  This lets you validate LMS convergence on a laptop with no hardware.
+  Status thread : ~status_hz Hz print (shows tracked frequency) + keepalive
 
 USAGE
 ─────
   # Real hardware (Pi 4B with DM556 + LSM6DSO):
-  sudo chrt -f 50 python3 vss_controller.py --id_dur 10
+  sudo chrt -f 50 python3 vss_controller.py --id_dur 30 --dir_invert --max_sps 16000
 
   # Simulation (any machine):
   python3 vss_controller.py --simulate --id_dur 5 --mu 5e-3
 
   # Skip straight to known frequencies (bypass Phase 1):
-  sudo chrt -f 50 python3 vss_controller.py --skip_id --manual_freqs 5.0 12.0
+  sudo chrt -f 50 python3 vss_controller.py --skip_id --manual_freqs 12.0
 
-  # Faster convergence demo with seeded initial amplitude:
-  sudo chrt -f 50 python3 vss_controller.py --id_dur 10 --init_amp_gain 0.3 --mu 2e-3
+  # Adaptive frequency tracking enabled:
+  sudo chrt -f 50 python3 vss_controller.py --id_dur 30 --dir_invert \\
+      --max_sps 16000 --mu 5e-4 --mu_omega 5e-6
 """
 
 import argparse
@@ -81,9 +83,6 @@ DEFAULT_DIR_BCM        = 16
 PULSE_HIGH_US          = 5
 ENABLE_PIN             = 25
 
-# Simulation plant model:
-# A counterweight of this mass (kg) at this structure mass (kg) gives ~10 m/s²/m
-# at the IMU, i.e. 0.01 m/s² per mm.  Tunable via --sim_plant_gain.
 DEFAULT_SIM_PLANT_GAIN = 0.01      # m/s² per mm of counterweight displacement
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,12 +120,7 @@ def sim_read_accel(t: float, lms_coeffs: list, freqs: list,
                    plant_gain: float) -> float:
     """
     Simulated IMU = disturbance + effect of counterweight motion.
-
-    Plant model (linear, no phase lag):
-      effect = plant_gain × Σ xᵢ(t)
-    where xᵢ(t) = Cᵢ·cos(ωᵢt) + Sᵢ·sin(ωᵢt)  [mm]
-
-    At LMS convergence: effect → -disturbance → e → 0.
+    Plant model (linear, no phase lag): effect = plant_gain × Σ xᵢ(t)
     """
     e = sim_disturbance(t)
     for i, f in enumerate(freqs):
@@ -155,82 +149,51 @@ def parse_args():
 
     # ── Hardware ──────────────────────────────────────────────────────────────
     hw = p.add_argument_group("Hardware")
-    hw.add_argument("--step",            type=int,   default=DEFAULT_STEP_BCM,
-                    help="BCM STEP pin")
-    hw.add_argument("--dir",             type=int,   default=DEFAULT_DIR_BCM,
-                    help="BCM DIR pin")
-    hw.add_argument("--dir_invert",      action="store_true",
-                    help="Invert DIR polarity")
-    hw.add_argument("--pulley_d_mm",     type=float, default=DEFAULT_PULLEY_D_MM,
-                    help="Belt pulley diameter (mm)")
-    hw.add_argument("--pulses_per_rev",  type=float, default=DEFAULT_PULSES_PER_REV,
-                    help="Driver microstep setting (pulses/rev)")
-    hw.add_argument("--max_sps",         type=float, default=8000.0,
-                    help="Hard speed cap (steps/sec)")
-    hw.add_argument("--deadband_sps",    type=float, default=20.0,
-                    help="No-step zone near velocity zero-crossings (sps)")
-    hw.add_argument("--chunk_ms",        type=float, default=50.0,
-                    help="DMA waveform chunk duration (ms). "
-                         "Also the max latency from stop command to motor halt.")
-    hw.add_argument("--dir_setup_us",    type=int,   default=20,
-                    help="DIR→STEP setup delay (µs)")
-    hw.add_argument("--dir_blanking_us", type=int,   default=200,
-                    help="STEP-off blanking before DIR flip (µs)")
+    hw.add_argument("--step",            type=int,   default=DEFAULT_STEP_BCM)
+    hw.add_argument("--dir",             type=int,   default=DEFAULT_DIR_BCM)
+    hw.add_argument("--dir_invert",      action="store_true")
+    hw.add_argument("--pulley_d_mm",     type=float, default=DEFAULT_PULLEY_D_MM)
+    hw.add_argument("--pulses_per_rev",  type=float, default=DEFAULT_PULSES_PER_REV)
+    hw.add_argument("--max_sps",         type=float, default=8000.0)
+    hw.add_argument("--deadband_sps",    type=float, default=20.0)
+    hw.add_argument("--chunk_ms",        type=float, default=50.0)
+    hw.add_argument("--dir_setup_us",    type=int,   default=20)
+    hw.add_argument("--dir_blanking_us", type=int,   default=200)
 
     # ── Phase 1: Identification ───────────────────────────────────────────────
     id_g = p.add_argument_group("Phase 1 — Identification")
-    id_g.add_argument("--id_dur",    type=float, default=10.0,
-                      help="IMU capture duration for FFT identification (s)")
-    id_g.add_argument("--id_fs",     type=float, default=800.0,
-                      help="Target IMU sampling rate during identification (Hz)")
-    id_g.add_argument("--min_freq",  type=float, default=1.0,
-                      help="Lower bound of cancellation band (Hz)")
-    id_g.add_argument("--max_freq",  type=float, default=50.0,
-                      help="Upper bound of cancellation band (Hz)")
-    id_g.add_argument("--n_tones",   type=int,   default=3,
-                      help="Max number of dominant tones to cancel (1–3)")
-    id_g.add_argument("--skip_id",   action="store_true",
-                      help="Skip Phase 1 entirely; use --manual_freqs instead")
+    id_g.add_argument("--id_dur",       type=float, default=10.0)
+    id_g.add_argument("--id_fs",        type=float, default=800.0)
+    id_g.add_argument("--min_freq",     type=float, default=1.0)
+    id_g.add_argument("--max_freq",     type=float, default=50.0)
+    id_g.add_argument("--n_tones",      type=int,   default=3)
+    id_g.add_argument("--skip_id",      action="store_true")
     id_g.add_argument("--manual_freqs", type=float, nargs="+", default=[],
-                      metavar="HZ",
-                      help="Tone frequencies to use when --skip_id is set")
+                      metavar="HZ")
 
     # ── Phase 2: LMS control ──────────────────────────────────────────────────
     lms = p.add_argument_group("Phase 2 — LMS Adaptive Control")
     lms.add_argument("--mu",               type=float, default=5e-4,
-                     help="LMS learning rate µ.  Units: mm · s² / m "
-                          "(i.e. how many mm the coefficient shifts per m/s² "
-                          "of error per sample).  Typical range 1e-4 – 5e-3.")
-    lms.add_argument("--control_fs",       type=float, default=800.0,
-                     help="IMU sample rate during active cancellation (Hz)")
-    lms.add_argument("--max_amp_per_tone", type=float, default=20.0,
-                     help="Hard amplitude cap per tone (mm peak)")
-    lms.add_argument("--max_total_amp",    type=float, default=60.0,
-                     help="Hard cap on sum of all tone amplitudes (mm). "
-                          "Must be ≤ HALF_TRAVEL_MM (75 mm).")
-    lms.add_argument("--init_amp_gain",    type=float, default=0.0,
-                     help="Scale factor applied to FFT-derived displacement "
-                          "estimate to seed initial LMS amplitude. "
-                          "0 = start from zero (safest). "
-                          "0.1–0.5 gives faster early convergence.")
-    lms.add_argument("--cancel_dur",       type=float, default=0.0,
-                     help="Cancellation run time (s). 0 = run until Ctrl-C.")
+                     help="Amplitude/phase learning rate (mm·s²/m). "
+                          "Rule of thumb: µ < 1/(fs·2n·signal²). "
+                          "Typical range 1e-4 – 5e-3.")
+    lms.add_argument("--mu_omega",         type=float, default=None,
+                     help="Frequency learning rate (rad/s per m/s² per sample). "
+                          "Default: µ × 0.01.  Set 0 to disable frequency tracking.")
+    lms.add_argument("--control_fs",       type=float, default=800.0)
+    lms.add_argument("--max_amp_per_tone", type=float, default=20.0)
+    lms.add_argument("--max_total_amp",    type=float, default=60.0)
+    lms.add_argument("--init_amp_gain",    type=float, default=0.0)
+    lms.add_argument("--cancel_dur",       type=float, default=0.0)
 
     # ── Simulation ────────────────────────────────────────────────────────────
     sim = p.add_argument_group("Simulation")
-    sim.add_argument("--simulate",        action="store_true",
-                     help="Use synthetic IMU + simple plant model (no hardware)")
-    sim.add_argument("--sim_plant_gain",  type=float, default=DEFAULT_SIM_PLANT_GAIN,
-                     help="Simulated plant gain: m/s² per mm of counterweight "
-                          "displacement.  Default models ~0.3 kg counterweight "
-                          "on a ~30 kg structure.")
+    sim.add_argument("--simulate",        action="store_true")
+    sim.add_argument("--sim_plant_gain",  type=float, default=DEFAULT_SIM_PLANT_GAIN)
 
     # ── Misc ──────────────────────────────────────────────────────────────────
-    p.add_argument("--status_hz",        type=float, default=2.0,
-                   help="Status print rate (Hz). 0 = off.")
-    p.add_argument("--no_travel_safety", action="store_true",
-                   help="Disable software travel-limit check (hardware limits "
-                        "via limit switches remain active).")
+    p.add_argument("--status_hz",        type=float, default=2.0)
+    p.add_argument("--no_travel_safety", action="store_true")
 
     return p.parse_args()
 
@@ -243,10 +206,7 @@ def identify_disturbance(args) -> list:
     Collect IMU time series, compute single-sided FFT, pick top dominant
     peaks in [min_freq, max_freq].
 
-    Returns
-    -------
-    list of (freq_hz: float, accel_amp: float) tuples, sorted by amplitude,
-    length ≤ args.n_tones.
+    Returns list of (freq_hz, accel_amp) tuples, length ≤ args.n_tones.
     """
     print(f"\n{'─'*56}")
     print(f"  PHASE 1 — IDENTIFY")
@@ -282,27 +242,24 @@ def identify_disturbance(args) -> list:
             pct = 100 * i / n_target
             print(f"  {pct:3.0f}%  t={t:.1f}s  last={samples[i]:+.4f} m/s²")
 
-    # Measured sample rate
-    dts    = np.diff(t_stamps)
+    dts     = np.diff(t_stamps)
     fs_meas = 1.0 / np.mean(dts) if len(dts) else args.id_fs
     print(f"  Measured fs: {fs_meas:.1f} Hz")
 
-    # ── FFT with Hann window ──────────────────────────────────────────────────
-    x   = samples - np.mean(samples)          # remove DC
+    x   = samples - np.mean(samples)
     n   = len(x)
     win = np.hanning(n)
-    cg  = np.mean(win)                        # coherent gain correction
+    cg  = np.mean(win)
     X   = np.fft.rfft(x * win)
     freqs = np.fft.rfftfreq(n, d=1.0 / fs_meas)
     amps  = np.abs(X) / (n * cg)
     if n > 1:
-        amps[1:-1] *= 2.0                     # single-sided correction
+        amps[1:-1] *= 2.0
 
-    # ── Band-limited peak picking ─────────────────────────────────────────────
     if len(freqs) < 2:
         return []
     bin_hz     = freqs[1] - freqs[0]
-    guard_bins = max(2, int(2.0 / bin_hz))    # 2 Hz guard band around each peak
+    guard_bins = max(2, int(2.0 / bin_hz))
 
     mask = (freqs >= args.min_freq) & (freqs <= args.max_freq)
     idxs = np.where(mask)[0]
@@ -329,7 +286,6 @@ def identify_disturbance(args) -> list:
 
     print(f"\n  Identified {len(peaks)} dominant tone(s):")
     for j, (f, a) in enumerate(peaks, 1):
-        # Provide displacement context (structure, not VSS)
         disp_mm = a / (2 * math.pi * f) ** 2 * 1000
         print(f"    {j})  {f:8.3f} Hz  |  {a:.4g} m/s²  "
               f"|  ~{disp_mm:.4f} mm structural disp.")
@@ -341,14 +297,7 @@ def identify_disturbance(args) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def clamp_coeffs(coeffs: list, max_per_tone: float, max_total: float):
-    """
-    In-place amplitude clamp on [[C₀,S₀], [C₁,S₁], ...] list.
-
-    1. Each tone:  Aᵢ = √(Cᵢ²+Sᵢ²)  clamped to max_per_tone.
-    2. Total:      Σ Aᵢ               clamped to max_total (proportional scale).
-
-    Called inside lms_lock, so no additional locking needed.
-    """
+    """In-place amplitude clamp on [[C₀,S₀], ...] list."""
     amps = []
     for cs in coeffs:
         A = math.sqrt(cs[0] ** 2 + cs[1] ** 2)
@@ -368,19 +317,13 @@ def clamp_coeffs(coeffs: list, max_per_tone: float, max_total: float):
 
 
 def coeffs_to_aphi(coeffs: list):
-    """
-    [[C, S], ...] → (A_list, PHI_list) for compute_chunk.
-
-    Derivation:
-      C·cos(ωt) + S·sin(ωt) = A·sin(ωt + φ)
-      → A = √(C²+S²),   φ = atan2(C, S)
-    """
+    """[[C, S], ...] → (A_list, PHI_list) for compute_chunk."""
     A   = [math.sqrt(cs[0] ** 2 + cs[1] ** 2) for cs in coeffs]
     PHI = [math.atan2(cs[0], cs[1])            for cs in coeffs]
     return A, PHI
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DMA waveform engine (ported from functionStepper_wave.py)
+# DMA waveform engine
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_chunk(t_start, chunk_s, A, F, PHI, k,
@@ -389,11 +332,6 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
                   dir_blanking_us, dir_setup_us):
     """
     Build one DMA waveform chunk covering [t_start, t_start + chunk_s).
-
-    Each step's inter-pulse gap encodes instantaneous velocity; DIR changes
-    embed blanking + setup delays directly in the pulse stream so the DMA
-    engine handles their timing with zero CPU involvement.
-
     Returns (pulses, end_dir, t_end, net_steps).
     """
     STEP_BIT      = 1 << step_pin
@@ -407,21 +345,18 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
     net_steps   = 0
 
     while t < t_end:
-        # Instantaneous velocity: v = dx/dt = Σ Aᵢ·ωᵢ·cos(ωᵢt + φᵢ)  [mm/s]
         v = sum(
             A[i] * (2.0 * math.pi * F[i]) * math.cos(2.0 * math.pi * F[i] * t + PHI[i])
             for i in range(len(A)) if A[i] and F[i]
         )
         sps = min(abs(v) * k, max_sps)
 
-        # Near zero-crossing: emit no-op delay to preserve phase clock
         if sps < deadband_sps:
             wait_us = min(1000, max(1, int((t_end - t) * 1e6)))
             pulses.append(pigpio.pulse(0, 0, wait_us))
             t += wait_us / 1e6
             continue
 
-        # Direction change → blank STEP, flip DIR, wait setup (all in DMA)
         logical_dir = int(v >= 0.0) ^ int(dir_invert)
         if logical_dir != current_dir:
             if dir_blanking_us > 0:
@@ -445,43 +380,42 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
 
 
 def wave_dur_s(pulses) -> float:
-    """Exact wall-clock duration of a pigpio pulse list."""
     return sum(p.delay for p in pulses) / 1e6
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LMS thread
+# LMS thread  —  adapts C, S, and ω
 # ══════════════════════════════════════════════════════════════════════════════
 
-def lms_thread_fn(freqs, lms_coeffs, lms_lock, t_start,
+def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                   args, running, lms_stats):
     """
-    Runs continuously at ~control_fs Hz.
+    Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if µ_omega > 0,
+    frequency (ω) for each tone.
 
-    Each iteration:
-      1. Read IMU (or simulation).
-      2. For each tone i:
-           Cᵢ -= µ · e · cos(ωᵢt)
-           Sᵢ -= µ · e · sin(ωᵢt)
-      3. Clamp amplitudes.
+    KEY CHANGE vs. previous version
+    ────────────────────────────────
+    Phase accumulator replaces ωᵢ·t:
+      φᵢ += ωᵢ · dt   each sample
+    This ensures phase is continuous when ω changes mid-run.  Using ωᵢ·t
+    directly would create a phase jump whenever ω is updated.
 
-    WHY this converges:
-      The gradient of E[e²] w.r.t. Cᵢ is 2·E[e · ∂e/∂Cᵢ].
-      Standard LMS approximates ∂e/∂Cᵢ ≈ cos(ωᵢt) (identity plant assumption).
-      The orthogonal (C, S) pair jointly spans all phases, so convergence is
-      guaranteed for any plant phase shift as long as µ is small enough.
+    Frequency gradient:
+      ∂x/∂ω ≈ Sᵢ·cos(φᵢ) − Cᵢ·sin(φᵢ)   (quadrature signal)
+    This is the component of x(t) that is 90° ahead of the current output.
+    It points in the direction of increasing ω, so subtracting µ_omega·e·quad
+    drives ω toward the disturbance frequency.
 
-    µ TUNING GUIDE:
-      Too large  → oscillation or divergence (clamp engages repeatedly)
-      Too small  → slow convergence (many seconds to reach steady-state)
-      Rule of thumb: µ < 1 / (fs · P · max_expected_signal²)
-        where P = number of coefficients = 2 × n_tones.
-      For IMU signal ~0.5 m/s², fs=800, P=6:  µ < 1/(800·6·0.25) ≈ 8e-4.
-      Default 5e-4 is conservative. Raise to 2e-3 for faster demo convergence.
+    µ_omega tuning:
+      Start at µ × 0.01.  Too large → ω oscillates.  Too small → slow tracking.
+      Frequency drift in a DC motor is slow (seconds), so small µ_omega is fine.
     """
-    omegas = [2.0 * math.pi * f for f in freqs]
-    period = 1.0 / args.control_fs
-    mu     = args.mu
-    n      = len(freqs)
+    n        = len(freqs)
+    omegas   = [2.0 * math.pi * f for f in freqs]   # local, adapted each step
+    phis     = [0.0] * n                              # phase accumulators
+    period   = 1.0 / args.control_fs
+    dt       = period
+    mu       = args.mu
+    mu_omega = args.mu_omega if args.mu_omega is not None else mu * 0.01
 
     next_t = time.monotonic()
 
@@ -491,29 +425,55 @@ def lms_thread_fn(freqs, lms_coeffs, lms_lock, t_start,
             time.sleep(next_t - now)
             now = time.monotonic()
 
-        t = now - t_start
+        # ── Advance phase accumulators ────────────────────────────────────────
+        # Must happen BEFORE the IMU read so cos/sin refs are current.
+        for i in range(n):
+            phis[i] += omegas[i] * dt
+            # Keep phi in [-π, π] to avoid floating-point drift over hours
+            if phis[i] > math.pi:
+                phis[i] -= 2.0 * math.pi
 
         # ── Read error signal ─────────────────────────────────────────────────
-        # Hardware: plain I²C read.
-        # Simulation: read coefficients snapshot BEFORE update so the plant
-        # model sees the same coefficients that are currently playing.
         if args.simulate:
             with lms_lock:
                 snap = [list(c) for c in lms_coeffs]
-            e = sim_read_accel(t, snap, freqs, args.sim_plant_gain)
+            t_sim = now - t_start
+            e = sim_read_accel(t_sim, snap, freqs, args.sim_plant_gain)
         else:
             e = hw_read_accel()
 
-        # ── LMS gradient step ─────────────────────────────────────────────────
+        # ── LMS gradient steps ────────────────────────────────────────────────
         with lms_lock:
             for i in range(n):
-                wt = omegas[i] * t
-                lms_coeffs[i][0] -= mu * e * math.cos(wt)    # C update
-                lms_coeffs[i][1] -= mu * e * math.sin(wt)    # S update
+                cos_ref = math.cos(phis[i])
+                sin_ref = math.sin(phis[i])
+                C = lms_coeffs[i][0]
+                S = lms_coeffs[i][1]
+
+                # Amplitude / phase updates (unchanged from original)
+                lms_coeffs[i][0] -= mu * e * cos_ref
+                lms_coeffs[i][1] -= mu * e * sin_ref
+
+                # Frequency update (new)
+                if mu_omega > 0:
+                    quad = S * cos_ref - C * sin_ref   # quadrature signal
+                    omegas[i] -= mu_omega * e * quad
+
+                    # Clamp ω to [min_freq, max_freq] band
+                    f_hz = omegas[i] / (2.0 * math.pi)
+                    f_hz = max(args.min_freq, min(args.max_freq, f_hz))
+                    omegas[i] = 2.0 * math.pi * f_hz
+
             clamp_coeffs(lms_coeffs, args.max_amp_per_tone, args.max_total_amp)
 
-        lms_stats['e'] = e
-        lms_stats['t'] = t
+            # Publish adapted frequencies for main loop + status thread
+            for i in range(n):
+                lms_freqs[i] = omegas[i] / (2.0 * math.pi)
+
+        lms_stats['e']     = e
+        lms_stats['t']     = now - t_start
+        lms_stats['freqs'] = [o / (2.0 * math.pi) for o in omegas]
+
         next_t += period
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -521,8 +481,9 @@ def lms_thread_fn(freqs, lms_coeffs, lms_lock, t_start,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
-                     args, running, freqs, lms_stats):
-    """Periodic status print + pigpiod keepalive."""
+                     args, running, init_freqs, lms_stats):
+    """Periodic status print + pigpiod keepalive.
+    Shows tracked (adapted) frequency alongside amplitude and phase."""
     if args.status_hz <= 0:
         return
 
@@ -546,6 +507,9 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
             with shared_lock:
                 sh = dict(shared)
 
+            # Use tracked frequencies from lms_stats if available
+            tracked_freqs = lms_stats.get('freqs', init_freqs)
+
             total_A = sum(math.sqrt(cs[0] ** 2 + cs[1] ** 2) for cs in snap)
             print(
                 f"\nt={sh.get('t', 0):7.3f}s  "
@@ -553,11 +517,14 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
                 f"ΣA={total_A:.2f}mm  "
                 f"e={lms_stats.get('e', 0):+.4f} m/s²"
             )
-            for i, f in enumerate(freqs):
-                C, S = snap[i]
-                A   = math.sqrt(C ** 2 + S ** 2)
-                phi = math.degrees(math.atan2(C, S))
-                print(f"  tone{i+1}  {f:.2f}Hz  "
+            for i, f_init in enumerate(init_freqs):
+                C, S   = snap[i]
+                A      = math.sqrt(C ** 2 + S ** 2)
+                phi    = math.degrees(math.atan2(C, S))
+                f_now  = tracked_freqs[i] if i < len(tracked_freqs) else f_init
+                # Show tracked frequency; mark with * if it has drifted > 0.05 Hz
+                drift_marker = "*" if abs(f_now - f_init) > 0.05 else " "
+                print(f"  tone{i+1}  {f_now:.3f}Hz{drift_marker} "
                       f"A={A:.3f}mm  φ={phi:+.1f}°  "
                       f"C={C:+.4f}  S={S:+.4f}")
 
@@ -571,18 +538,13 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
 
 def run_cancellation(pi, tones, args, k):
     """
-    tones : [(freq_hz, accel_amp), ...]  — from identify_disturbance()
-            or [(freq_hz, 0.0), ...]     — from --manual_freqs
-
     Initialises LMS coefficients, starts LMS and status threads,
     then runs the DMA double-buffer stepper loop.
 
-    Coefficient handoff: at each chunk boundary (~chunk_ms), the main loop
-    takes a snapshot of the latest LMS coefficients, converts (C, S) → (A, φ),
-    and feeds them to compute_chunk.  The LMS thread runs asynchronously and
-    may update 40 times between chunk boundaries; only the snapshot at handoff
-    matters.  This is the correct tradeoff: sub-chunk coefficient changes
-    would misalign the waveform's internal position tracking.
+    NEW: lms_freqs is a shared mutable list that the LMS thread updates
+    as ω adapts.  The main loop reads lms_freqs at each chunk boundary
+    and passes the adapted frequency to compute_chunk so the DMA waveform
+    always matches the current LMS reference signal.
     """
     print(f"\n{'─'*56}")
     print(f"  PHASE 2 — CANCEL")
@@ -590,30 +552,34 @@ def run_cancellation(pi, tones, args, k):
 
     pi.wave_clear()
 
-    F = [f for f, _ in tones]
-    n = len(F)
+    F_init = [f for f, _ in tones]   # identified frequencies (fixed reference)
+    n      = len(F_init)
+
+    mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
+    freq_tracking = mu_omega > 0
+    print(f"  Frequency tracking: {'ON  (µ_omega=' + str(mu_omega) + ')' if freq_tracking else 'OFF'}")
 
     # ── Initialise LMS coefficients ───────────────────────────────────────────
-    # Strategy: if init_amp_gain > 0, seed from FFT-derived displacement
-    # estimate.  Start as pure cosine (C=A, S=0) so LMS has a finite gradient
-    # from sample 0.  If gain=0, start from zero — safest, but slower ramp-up.
     lms_coeffs = []
     for f, accel_amp in tones:
         if args.init_amp_gain > 0 and accel_amp > 0:
-            disp_mm = accel_amp / (2 * math.pi * f) ** 2 * 1000  # structural mm
+            disp_mm = accel_amp / (2 * math.pi * f) ** 2 * 1000
             A_init  = min(disp_mm * args.init_amp_gain, args.max_amp_per_tone)
-            lms_coeffs.append([A_init, 0.0])   # C=A, S=0 → x(t)=A·cos(ωt)
+            lms_coeffs.append([A_init, 0.0])
         else:
             lms_coeffs.append([0.0, 0.0])
 
+    # Shared mutable frequency list — LMS thread writes, main loop reads
+    lms_freqs = list(F_init)
+
     print(f"  Initial amplitudes:")
-    for i, (f, cs) in enumerate(zip(F, lms_coeffs)):
+    for i, (f, cs) in enumerate(zip(F_init, lms_coeffs)):
         A_i = math.sqrt(cs[0] ** 2 + cs[1] ** 2)
-        print(f"    tone{i+1}  {f:.2f}Hz  A₀={A_i:.3f}mm")
+        print(f"    tone{i+1}  {f:.3f}Hz  A₀={A_i:.3f}mm")
 
     lms_lock    = threading.Lock()
     running     = [True]
-    lms_stats   = {'e': 0.0, 't': 0.0}
+    lms_stats   = {'e': 0.0, 't': 0.0, 'freqs': list(F_init)}
     shared      = {'t': 0.0, 'x_est': 0.0}
     shared_lock = threading.Lock()
     chunk_s     = args.chunk_ms / 1000.0
@@ -625,7 +591,6 @@ def run_cancellation(pi, tones, args, k):
     pi.write(ENABLE_PIN, 1)
     pi.wave_clear()
 
-    # Set initial DIR before first pulse
     pi.write(args.dir, 1)
     time.sleep(args.dir_setup_us / 1e6)
 
@@ -634,7 +599,8 @@ def run_cancellation(pi, tones, args, k):
     # ── Spawn threads ─────────────────────────────────────────────────────────
     lms_t = threading.Thread(
         target=lms_thread_fn,
-        args=(F, lms_coeffs, lms_lock, t_wall_start, args, running, lms_stats),
+        args=(F_init, lms_coeffs, lms_freqs, lms_lock,
+              t_wall_start, args, running, lms_stats),
         daemon=True,
         name="lms-imu",
     )
@@ -643,36 +609,36 @@ def run_cancellation(pi, tones, args, k):
     stat_t = threading.Thread(
         target=status_thread_fn,
         args=(pi, lms_coeffs, lms_lock, shared, shared_lock,
-              args, running, F, lms_stats),
+              args, running, F_init, lms_stats),
         daemon=True,
         name="status",
     )
     stat_t.start()
 
     t_phase    = 0.0
-    s_est      = 0.0          # cumulative step count (signed)
+    s_est      = 0.0
     last_dir   = 1
     t_end_wall = (t_wall_start + args.cancel_dur) if args.cancel_dur > 0 else None
 
-    # Print run parameters
     est_peak_sps = sum(
         math.sqrt(cs[0]**2 + cs[1]**2) * 2*math.pi*f * k
-        for cs, f in zip(lms_coeffs, F)
+        for cs, f in zip(lms_coeffs, F_init)
     )
-    print(f"\n  µ={args.mu}  control_fs={args.control_fs:.0f}Hz  "
-          f"chunk={chunk_s*1000:.0f}ms")
+    print(f"\n  µ={args.mu}  µ_omega={mu_omega}  "
+          f"control_fs={args.control_fs:.0f}Hz  chunk={chunk_s*1000:.0f}ms")
     print(f"  max_amp_per_tone={args.max_amp_per_tone}mm  "
           f"max_total_amp={args.max_total_amp}mm")
-    print(f"  Tones: {[f'{f:.2f}Hz' for f in F]}")
+    print(f"  Tones: {[f'{f:.3f}Hz' for f in F_init]}")
     print(f"  Est. initial peak sps: {est_peak_sps:.0f}")
     print("  Ctrl-C to stop.\n")
 
     # ── Compute and fire first chunk ──────────────────────────────────────────
     with lms_lock:
         A, PHI = coeffs_to_aphi(lms_coeffs)
+        F_cur  = list(lms_freqs)
 
     pulses_c, last_dir, t_phase, steps_c = compute_chunk(
-        t_phase, chunk_s, A, F, PHI, k,
+        t_phase, chunk_s, A, F_cur, PHI, k,
         args.max_sps, args.deadband_sps,
         args.step, args.dir, last_dir, args.dir_invert,
         args.dir_blanking_us, args.dir_setup_us,
@@ -685,39 +651,30 @@ def run_cancellation(pi, tones, args, k):
     t_chunk_wall = time.monotonic()
 
     # ── Double-buffer main loop ───────────────────────────────────────────────
-    #
-    #  While chunk N plays on DMA hardware, Python:
-    #    1. Reads latest LMS coefficients (takes ~1 µs)
-    #    2. Calls compute_chunk to build chunk N+1 (CPU-bound, ~5–15 ms)
-    #    3. Sleeps until ~10 ms before chunk N finishes
-    #    4. Polls wave_tx_busy() until done
-    #    5. Fires chunk N+1 immediately (< 100 µs gap)
-    #    6. Updates position integrator with exact step count from chunk N
-    #
     try:
         while True:
             if t_end_wall and time.monotonic() >= t_end_wall:
                 break
 
-            # Build next chunk while current one plays
+            # Snapshot LMS state — coefficients AND adapted frequencies
             with lms_lock:
                 A, PHI = coeffs_to_aphi(lms_coeffs)
+                F_cur  = list(lms_freqs)   # ← adapted frequency for chunk
+
             pulses_n, dir_n, t_next, steps_n = compute_chunk(
-                t_phase, chunk_s, A, F, PHI, k,
+                t_phase, chunk_s, A, F_cur, PHI, k,
                 args.max_sps, args.deadband_sps,
                 args.step, args.dir, last_dir, args.dir_invert,
                 args.dir_blanking_us, args.dir_setup_us,
             )
             dur_n = wave_dur_s(pulses_n) or chunk_s
 
-            # Sleep until ~10ms before end of current chunk, then poll
             sleep_s = dur_c - (time.monotonic() - t_chunk_wall) - 0.010
             if sleep_s > 0:
                 time.sleep(sleep_s)
             while pi.wave_tx_busy():
                 time.sleep(0.0001)
 
-            # Current chunk finished — update position integrator
             s_est += steps_c
             x_est  = s_est / k
 
@@ -727,14 +684,13 @@ def run_cancellation(pi, tones, args, k):
                     f"exceeds ±{HALF_TRAVEL_MM}mm"
                 )
 
-            # THE FIX: free CBs before allocating next wave
+            # Free CBs before allocating next wave
             pi.wave_delete(wave_c)
             pi.wave_add_generic(pulses_n)
             wave_n = pi.wave_create()
             pi.wave_send_once(wave_n)
             t_chunk_wall = time.monotonic()
 
-            # Update shared status (non-blocking)
             if shared_lock.acquire(blocking=False):
                 try:
                     shared['t']     = time.monotonic() - t_wall_start
@@ -742,7 +698,6 @@ def run_cancellation(pi, tones, args, k):
                 finally:
                     shared_lock.release()
 
-            # Rotate buffers
             wave_c   = wave_n
             dur_c    = dur_n
             steps_c  = steps_n
@@ -770,15 +725,17 @@ def run_cancellation(pi, tones, args, k):
         print("\nCancellation stopped.")
         print(f"Final x_est = {s_est / k:+.2f} mm  ({int(s_est):+d} steps)")
 
-        # Print final LMS state
         with lms_lock:
-            snap = [list(c) for c in lms_coeffs]
+            snap       = [list(c) for c in lms_coeffs]
+            final_freqs = list(lms_freqs)
         print("\nFinal LMS coefficients:")
-        for i, f in enumerate(F):
-            C, S = snap[i]
-            A   = math.sqrt(C**2 + S**2)
-            phi = math.degrees(math.atan2(C, S))
-            print(f"  tone{i+1}  {f:.2f}Hz  A={A:.3f}mm  φ={phi:+.1f}°")
+        for i, f_init in enumerate(F_init):
+            C, S   = snap[i]
+            A      = math.sqrt(C**2 + S**2)
+            phi    = math.degrees(math.atan2(C, S))
+            f_final = final_freqs[i]
+            print(f"  tone{i+1}  {f_final:.3f}Hz (init {f_init:.3f}Hz)  "
+                  f"A={A:.3f}mm  φ={phi:+.1f}°")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
@@ -787,7 +744,6 @@ def run_cancellation(pi, tones, args, k):
 def main():
     args = parse_args()
 
-    # Validate
     if not args.simulate and not _HW_IMU_AVAILABLE:
         sys.exit(
             "ERROR: adafruit_lsm6ds not found.\n"
@@ -797,10 +753,11 @@ def main():
 
     if args.max_total_amp > HALF_TRAVEL_MM:
         sys.exit(f"ERROR: --max_total_amp ({args.max_total_amp}mm) exceeds "
-                 f"HALF_TRAVEL_MM ({HALF_TRAVEL_MM}mm).  Position integrator "
-                 f"would trip the safety limit at full amplitude.")
+                 f"HALF_TRAVEL_MM ({HALF_TRAVEL_MM}mm).")
 
     k = k_steps_per_mm(args.pulley_d_mm, args.pulses_per_rev)
+
+    mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
 
     print("═" * 56)
     print("  VSS CONTROLLER  —  Adaptive Vibration Suppression")
@@ -810,6 +767,8 @@ def main():
           f"(≈{HALF_TRAVEL_MM * k:.0f} steps)")
     print(f"  simulate   = {args.simulate}")
     print(f"  µ          = {args.mu}")
+    print(f"  µ_omega    = {mu_omega}  "
+          f"({'tracking ON' if mu_omega > 0 else 'tracking OFF'})")
 
     # ── Phase 1: Identify ────────────────────────────────────────────────────
     if args.skip_id:
