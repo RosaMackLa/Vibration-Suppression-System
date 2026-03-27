@@ -699,11 +699,9 @@ def run_cancellation(pi, tones, args, k):
             if t_end_wall and time.monotonic() >= t_end_wall:
                 break
 
-            # Snapshot LMS coefficients for next chunk
+            # Build next chunk while current one plays
             with lms_lock:
                 A, PHI = coeffs_to_aphi(lms_coeffs)
-
-            # Build next chunk (runs while current chunk plays)
             pulses_n, dir_n, t_next, steps_n = compute_chunk(
                 t_phase, chunk_s, A, F, PHI, k,
                 args.max_sps, args.deadband_sps,
@@ -712,14 +710,14 @@ def run_cancellation(pi, tones, args, k):
             )
             dur_n = wave_dur_s(pulses_n) or chunk_s
 
-            # Sleep until 10 ms before end of current chunk, then poll
+            # Sleep until ~10ms before end of current chunk, then poll
             sleep_s = dur_c - (time.monotonic() - t_chunk_wall) - 0.010
             if sleep_s > 0:
                 time.sleep(sleep_s)
             while pi.wave_tx_busy():
                 time.sleep(0.0001)
 
-            # ── Current chunk just finished ────────────────────────────────
+            # Current chunk finished — update position integrator
             s_est += steps_c
             x_est  = s_est / k
 
@@ -729,16 +727,14 @@ def run_cancellation(pi, tones, args, k):
                     f"exceeds ±{HALF_TRAVEL_MM}mm"
                 )
 
-            # Fire next chunk immediately
+            # THE FIX: free CBs before allocating next wave
+            pi.wave_delete(wave_c)
             pi.wave_add_generic(pulses_n)
             wave_n = pi.wave_create()
             pi.wave_send_once(wave_n)
             t_chunk_wall = time.monotonic()
 
-            # Free the chunk that just finished
-            pi.wave_delete(wave_c)
-
-            # Update shared status (non-blocking skip if contended)
+            # Update shared status (non-blocking)
             if shared_lock.acquire(blocking=False):
                 try:
                     shared['t']     = time.monotonic() - t_wall_start
