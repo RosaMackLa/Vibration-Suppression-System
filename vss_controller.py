@@ -588,6 +588,8 @@ def run_cancellation(pi, tones, args, k):
     print(f"  PHASE 2 — CANCEL")
     print(f"{'─'*56}")
 
+    pi.wave_clear()
+
     F = [f for f, _ in tones]
     n = len(F)
 
@@ -770,7 +772,7 @@ def run_cancellation(pi, tones, args, k):
         except Exception:
             pass
         print("\nCancellation stopped.")
-        print(f"Final x_est = {s_est / k:+.2f} mm  ({s_est:+d} steps)")
+        print(f"Final x_est = {s_est / k:+.2f} mm  ({int(s_est):+d} steps)")
 
         # Print final LMS state
         with lms_lock:
