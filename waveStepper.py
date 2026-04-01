@@ -212,7 +212,7 @@ def main():
     pi.set_mode(args.dir,  pigpio.OUTPUT)
     pi.set_mode(args.step, pigpio.OUTPUT)
     pi.set_mode(25, pigpio.OUTPUT)
-    pi.write(25, 1)   # enable hardware backstop interlock
+    pi.write(25, 0)   # enable hardware backstop interlock
     pi.wave_clear()
 
     # Set DIR pin to match initial velocity direction before first pulse
