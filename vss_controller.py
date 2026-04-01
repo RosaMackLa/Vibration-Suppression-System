@@ -33,8 +33,15 @@ ARCHITECTURE
 ────────────
   Main thread   : DMA double-buffer loop — reads latest (C, S, ω) at every
                   chunk boundary and passes adapted frequency to compute_chunk
-  LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp
+  LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp → log
   Status thread : ~status_hz Hz print (shows tracked frequency) + keepalive
+
+LOGGING & PLOTTING
+──────────────────
+  LMS state (t, e, C, S, f) is logged at --log_hz (default 100 Hz) into
+  in-memory lists.  After cancellation stops, plot_run() generates a
+  4-panel convergence plot (identical to vss_lms_sim.py) saved to --plot_out.
+  Use --no_plot to skip.  Use --plot_out run1.png to keep runs distinct.
 
 USAGE
 ─────
@@ -60,6 +67,9 @@ import sys
 import random
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')   # headless — no display needed on Pi
+import matplotlib.pyplot as plt
 import pigpio
 
 # ── Optional hardware IMU import ───────────────────────────────────────────────
@@ -190,6 +200,15 @@ def parse_args():
     sim = p.add_argument_group("Simulation")
     sim.add_argument("--simulate",        action="store_true")
     sim.add_argument("--sim_plant_gain",  type=float, default=DEFAULT_SIM_PLANT_GAIN)
+
+    # ── Logging & plotting ────────────────────────────────────────────────────
+    log = p.add_argument_group("Logging & Plotting")
+    log.add_argument("--log_hz",   type=float, default=100.0,
+                     help="Rate at which LMS state is logged [Hz]. Default 100.")
+    log.add_argument("--no_plot",  action="store_true",
+                     help="Skip plot generation after cancellation.")
+    log.add_argument("--plot_out", type=str,   default="vss_run_plot.png",
+                     help="Output filename for the convergence plot.")
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     p.add_argument("--status_hz",        type=float, default=2.0)
@@ -323,6 +342,91 @@ def coeffs_to_aphi(coeffs: list):
     return A, PHI
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Convergence plot
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_run(log_t, log_e, log_C, log_S, log_f, args):
+    """
+    Generate 4-panel convergence plot from logged LMS data.
+    Mirrors the panels in vss_lms_sim.py for direct comparison.
+    """
+    n = len(log_t)
+    if n < 2:
+        print("  Not enough data to plot.")
+        return
+
+    log_t = np.array(log_t)
+    log_e = np.array(log_e)
+    log_C = np.array(log_C)
+    log_S = np.array(log_S)
+    log_f = np.array(log_f)
+    log_A = np.sqrt(log_C**2 + log_S**2)
+
+    # Rolling e_rms — 2-second window at log_hz
+    window = max(1, int(2.0 * args.log_hz))
+    e_rms = np.array([
+        np.sqrt(np.mean(log_e[max(0, i - window):i + 1]**2))
+        for i in range(n)
+    ])
+
+    mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
+
+    fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+    fig.suptitle(
+        f"VSS Hardware Run\n"
+        f"µ={args.mu}  µω={mu_omega}  fs={args.control_fs:.0f}Hz  "
+        f"dur={log_t[-1]:.1f}s",
+        fontsize=10
+    )
+
+    # Panel 1 — residual error
+    ax = axes[0]
+    ax.plot(log_t, log_e, alpha=0.25, color='gray', linewidth=0.4, label='e(t)')
+    ax.plot(log_t, e_rms, color='crimson', linewidth=1.5, label='e_rms (2s window)')
+    ax.axhline(0, color='black', linewidth=0.5)
+    ax.set_ylabel('Error [m/s²]')
+    ax.set_title('Residual Error  (should fall monotonically if converging)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2 — actuator amplitude
+    ax = axes[1]
+    ax.plot(log_t, log_A, color='steelblue', linewidth=1.5)
+    ax.axhline(args.max_amp_per_tone, color='red', linestyle='--',
+               linewidth=0.8, label=f'clamp = {args.max_amp_per_tone}mm')
+    ax.set_ylabel('Amplitude [mm]')
+    ax.set_title('Actuator Amplitude |C + jS|  (should grow then plateau)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3 — C and S coefficients
+    ax = axes[2]
+    ax.plot(log_t, log_C, linewidth=1.0, label='C  (cos coeff)', color='royalblue')
+    ax.plot(log_t, log_S, linewidth=1.0, label='S  (sin coeff)', color='darkorange')
+    ax.axhline(0, color='black', linewidth=0.5)
+    ax.set_ylabel('[mm]')
+    ax.set_title('LMS Coefficients  (should settle; continuous rotation = diverging)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 4 — tracked frequency
+    ax = axes[3]
+    ax.plot(log_t, log_f, color='seagreen', linewidth=1.5)
+    if len(log_f):
+        ax.axhline(log_f[0], color='black', linestyle='--',
+                   linewidth=0.8, label=f'initial f = {log_f[0]:.3f} Hz')
+    ax.set_ylabel('Frequency [Hz]')
+    ax.set_xlabel('Time [s]')
+    ax.set_title('Tracked Frequency')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(args.plot_out, dpi=150)
+    print(f"  Plot saved: {args.plot_out}")
+    plt.close(fig)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DMA waveform engine
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -387,10 +491,10 @@ def wave_dur_s(pulses) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
-                  args, running, lms_stats):
+                  args, running, lms_stats, log_buf):
     """
     Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if µ_omega > 0,
-    frequency (ω) for each tone.
+    frequency (ω) for each tone.  Logs state to log_buf at --log_hz rate.
 
     KEY CHANGE vs. previous version
     ────────────────────────────────
@@ -416,6 +520,9 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
     dt       = period
     mu       = args.mu
     mu_omega = args.mu_omega if args.mu_omega is not None else mu * 0.01
+
+    log_every  = max(1, int(args.control_fs / args.log_hz))
+    log_ticker = 0
 
     next_t = time.monotonic()
 
@@ -450,11 +557,11 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                 C = lms_coeffs[i][0]
                 S = lms_coeffs[i][1]
 
-                # Amplitude / phase updates (unchanged from original)
+                # Amplitude / phase updates
                 lms_coeffs[i][0] -= mu * e * cos_ref
                 lms_coeffs[i][1] -= mu * e * sin_ref
 
-                # Frequency update (new)
+                # Frequency update
                 if mu_omega > 0:
                     quad = S * cos_ref - C * sin_ref   # quadrature signal
                     omegas[i] -= mu_omega * e * quad
@@ -473,6 +580,20 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
         lms_stats['e']     = e
         lms_stats['t']     = now - t_start
         lms_stats['freqs'] = [o / (2.0 * math.pi) for o in omegas]
+
+        # ── Periodic logging ──────────────────────────────────────────────────
+        log_ticker += 1
+        if log_ticker >= log_every:
+            log_ticker = 0
+            with lms_lock:
+                C0 = lms_coeffs[0][0]
+                S0 = lms_coeffs[0][1]
+                f0 = lms_freqs[0]
+            log_buf['t'].append(now - t_start)
+            log_buf['e'].append(e)
+            log_buf['C'].append(C0)
+            log_buf['S'].append(S0)
+            log_buf['f'].append(f0)
 
         next_t += period
 
@@ -541,10 +662,12 @@ def run_cancellation(pi, tones, args, k):
     Initialises LMS coefficients, starts LMS and status threads,
     then runs the DMA double-buffer stepper loop.
 
-    NEW: lms_freqs is a shared mutable list that the LMS thread updates
+    lms_freqs is a shared mutable list that the LMS thread updates
     as ω adapts.  The main loop reads lms_freqs at each chunk boundary
     and passes the adapted frequency to compute_chunk so the DMA waveform
     always matches the current LMS reference signal.
+
+    log_buf accumulates (t, e, C, S, f) at --log_hz rate for post-run plotting.
     """
     print(f"\n{'─'*56}")
     print(f"  PHASE 2 — CANCEL")
@@ -583,6 +706,7 @@ def run_cancellation(pi, tones, args, k):
     shared      = {'t': 0.0, 'x_est': 0.0}
     shared_lock = threading.Lock()
     chunk_s     = args.chunk_ms / 1000.0
+    log_buf     = {'t': [], 'e': [], 'C': [], 'S': [], 'f': []}
 
     # ── GPIO setup ────────────────────────────────────────────────────────────
     pi.set_mode(args.dir,   pigpio.OUTPUT)
@@ -600,7 +724,7 @@ def run_cancellation(pi, tones, args, k):
     lms_t = threading.Thread(
         target=lms_thread_fn,
         args=(F_init, lms_coeffs, lms_freqs, lms_lock,
-              t_wall_start, args, running, lms_stats),
+              t_wall_start, args, running, lms_stats, log_buf),
         daemon=True,
         name="lms-imu",
     )
@@ -630,6 +754,7 @@ def run_cancellation(pi, tones, args, k):
           f"max_total_amp={args.max_total_amp}mm")
     print(f"  Tones: {[f'{f:.3f}Hz' for f in F_init]}")
     print(f"  Est. initial peak sps: {est_peak_sps:.0f}")
+    print(f"  Logging at {args.log_hz:.0f} Hz → plot_out={args.plot_out}")
     print("  Ctrl-C to stop.\n")
 
     # ── Compute and fire first chunk ──────────────────────────────────────────
@@ -726,16 +851,22 @@ def run_cancellation(pi, tones, args, k):
         print(f"Final x_est = {s_est / k:+.2f} mm  ({int(s_est):+d} steps)")
 
         with lms_lock:
-            snap       = [list(c) for c in lms_coeffs]
+            snap        = [list(c) for c in lms_coeffs]
             final_freqs = list(lms_freqs)
         print("\nFinal LMS coefficients:")
         for i, f_init in enumerate(F_init):
-            C, S   = snap[i]
-            A      = math.sqrt(C**2 + S**2)
-            phi    = math.degrees(math.atan2(C, S))
+            C, S    = snap[i]
+            A       = math.sqrt(C**2 + S**2)
+            phi     = math.degrees(math.atan2(C, S))
             f_final = final_freqs[i]
             print(f"  tone{i+1}  {f_final:.3f}Hz (init {f_init:.3f}Hz)  "
                   f"A={A:.3f}mm  φ={phi:+.1f}°")
+
+        # ── Post-run convergence plot ─────────────────────────────────────────
+        if not args.no_plot:
+            print("\nGenerating convergence plot...")
+            plot_run(log_buf['t'], log_buf['e'], log_buf['C'],
+                     log_buf['S'], log_buf['f'], args)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
