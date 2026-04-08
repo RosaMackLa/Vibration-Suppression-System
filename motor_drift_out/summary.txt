@@ -1,0 +1,20 @@
+Motor Frequency Drift Characterization
+======================================
+
+Duration         : 300.0 s
+Sample rate      : target 800 Hz, actual 800.00 Hz
+Window size      : 10.0 s
+Windows analyzed : 30
+Search band      : [5.0, 15.0] Hz
+Dropped samples  : 0
+
+Statistics
+----------
+  Mean frequency : 9.1225 Hz
+  Std dev (σ)    : 0.1179 Hz
+  Peak-to-peak   : 0.4305 Hz
+  Linear drift   : +1.235 mHz/s (+0.371 Hz over full run)
+
+Recommendation
+--------------
+MODERATE DRIFT. FFT frequency tracker strongly recommended. Gradient tracker alone will lag and cause beat-frequency artifacts like you saw in Run 1.
