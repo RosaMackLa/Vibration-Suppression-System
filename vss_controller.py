@@ -36,6 +36,15 @@ ARCHITECTURE
   LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp → log
   Status thread : ~status_hz Hz print (shows tracked frequency) + keepalive
 
+AMPLITUDE CLAMPING
+──────────────────
+  Each tone has its own per-tone amplitude limit derived from --max_amp_per_tone
+  and the per-tone sps constraint (peak_sps = A × 2πf × k ≤ max_sps).
+  These are independent physical constraints — a high-frequency tone hits the
+  sps wall at a lower amplitude than a low-frequency tone.  per_tone_max_amp
+  is computed in main() and threaded through to clamp_coeffs so that the 9.3 Hz
+  tone is not penalised by the 28 Hz tone's tighter sps limit.
+
 LOGGING & PLOTTING
 ──────────────────
   LMS state (t, e, C, S, f) is logged at --log_hz (default 100 Hz) into
@@ -46,17 +55,20 @@ LOGGING & PLOTTING
 USAGE
 ─────
   # Real hardware (Pi 4B with DM556 + LSM6DSO):
-  sudo chrt -f 50 python3 vss_controller.py --id_dur 30 --dir_invert --max_sps 16000
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
+      --id_dur 30 --dir_invert --max_sps 50000
+
+  # Single known tone, fast µ:
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
+      --skip_id --manual_freqs 9.3 --mu 1e-3 --mu_omega 0 \
+      --max_sps 50000 --max_amp_per_tone 9 --cancel_dur 120 --dir_invert
 
   # Simulation (any machine):
   python3 vss_controller.py --simulate --id_dur 5 --mu 5e-3
 
-  # Skip straight to known frequencies (bypass Phase 1):
-  sudo chrt -f 50 python3 vss_controller.py --skip_id --manual_freqs 12.0
-
   # Adaptive frequency tracking enabled:
-  sudo chrt -f 50 python3 vss_controller.py --id_dur 30 --dir_invert \\
-      --max_sps 16000 --mu 5e-4 --mu_omega 5e-6
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
+      --id_dur 30 --dir_invert --max_sps 50000 --mu 5e-4 --mu_omega 5e-6
 """
 
 import argparse
@@ -184,14 +196,16 @@ def parse_args():
     # ── Phase 2: LMS control ──────────────────────────────────────────────────
     lms = p.add_argument_group("Phase 2 — LMS Adaptive Control")
     lms.add_argument("--mu",               type=float, default=5e-4,
-                     help="Amplitude/phase learning rate (mm·s²/m). "
+                     help="Amplitude/phase learning rate. "
                           "Rule of thumb: µ < 1/(fs·2n·signal²). "
                           "Typical range 1e-4 – 5e-3.")
     lms.add_argument("--mu_omega",         type=float, default=None,
-                     help="Frequency learning rate (rad/s per m/s² per sample). "
+                     help="Frequency learning rate. "
                           "Default: µ × 0.01.  Set 0 to disable frequency tracking.")
     lms.add_argument("--control_fs",       type=float, default=800.0)
-    lms.add_argument("--max_amp_per_tone", type=float, default=20.0)
+    lms.add_argument("--max_amp_per_tone", type=float, default=20.0,
+                     help="Requested max amplitude per tone (mm). Each tone's "
+                          "actual limit is min(this, sps-derived limit for that tone).")
     lms.add_argument("--max_total_amp",    type=float, default=60.0)
     lms.add_argument("--init_amp_gain",    type=float, default=0.0)
     lms.add_argument("--cancel_dur",       type=float, default=0.0)
@@ -315,16 +329,26 @@ def identify_disturbance(args) -> list:
 # LMS coefficient helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def clamp_coeffs(coeffs: list, max_per_tone: float, max_total: float):
-    """In-place amplitude clamp on [[C₀,S₀], ...] list."""
+def clamp_coeffs(coeffs: list, per_tone_max_amp, max_total: float):
+    """
+    In-place amplitude clamp on [[C₀,S₀], ...] list.
+
+    per_tone_max_amp may be a scalar (same limit for all tones) or a list
+    with one entry per tone.  Using a list allows each tone to have its own
+    sps-derived limit without penalising low-frequency tones with the tighter
+    constraint that applies to high-frequency tones.
+    """
     amps = []
-    for cs in coeffs:
+    for i, cs in enumerate(coeffs):
+        limit = (per_tone_max_amp[i]
+                 if isinstance(per_tone_max_amp, (list, tuple))
+                 else per_tone_max_amp)
         A = math.sqrt(cs[0] ** 2 + cs[1] ** 2)
-        if A > max_per_tone > 0:
-            r = max_per_tone / A
+        if limit > 0 and A > limit:
+            r = limit / A
             cs[0] *= r
             cs[1] *= r
-            A = max_per_tone
+            A = limit
         amps.append(A)
 
     total = sum(amps)
@@ -393,9 +417,9 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
     ax = axes[1]
     ax.plot(log_t, log_A, color='steelblue', linewidth=1.5)
     ax.axhline(args.max_amp_per_tone, color='red', linestyle='--',
-               linewidth=0.8, label=f'clamp = {args.max_amp_per_tone}mm')
+               linewidth=0.8, label=f'requested max = {args.max_amp_per_tone}mm')
     ax.set_ylabel('Amplitude [mm]')
-    ax.set_title('Actuator Amplitude |C + jS|  (should grow then plateau)')
+    ax.set_title('Actuator Amplitude |C + jS|  (tone 1 — should grow then plateau)')
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -491,31 +515,28 @@ def wave_dur_s(pulses) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
-                  args, running, lms_stats, log_buf):
+                  args, running, lms_stats, log_buf, per_tone_max_amp):
     """
     Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if µ_omega > 0,
     frequency (ω) for each tone.  Logs state to log_buf at --log_hz rate.
 
-    KEY CHANGE vs. previous version
-    ────────────────────────────────
-    Phase accumulator replaces ωᵢ·t:
-      φᵢ += ωᵢ · dt   each sample
-    This ensures phase is continuous when ω changes mid-run.  Using ωᵢ·t
-    directly would create a phase jump whenever ω is updated.
+    per_tone_max_amp is a list of per-tone amplitude limits (mm), derived
+    from --max_amp_per_tone and the per-tone sps constraint.  Passed through
+    to clamp_coeffs so each tone is clamped independently.
+
+    KEY DESIGN: Phase accumulator
+    ─────────────────────────────
+    φᵢ += ωᵢ · dt each sample replaces ωᵢ·t so that when ω changes
+    the phase evolves continuously with no discontinuity.
 
     Frequency gradient:
       ∂x/∂ω ≈ Sᵢ·cos(φᵢ) − Cᵢ·sin(φᵢ)   (quadrature signal)
-    This is the component of x(t) that is 90° ahead of the current output.
-    It points in the direction of increasing ω, so subtracting µ_omega·e·quad
+    Points in direction of increasing ω; subtracting µ_omega·e·quad
     drives ω toward the disturbance frequency.
-
-    µ_omega tuning:
-      Start at µ × 0.01.  Too large → ω oscillates.  Too small → slow tracking.
-      Frequency drift in a DC motor is slow (seconds), so small µ_omega is fine.
     """
     n        = len(freqs)
-    omegas   = [2.0 * math.pi * f for f in freqs]   # local, adapted each step
-    phis     = [0.0] * n                              # phase accumulators
+    omegas   = [2.0 * math.pi * f for f in freqs]
+    phis     = [0.0] * n
     period   = 1.0 / args.control_fs
     dt       = period
     mu       = args.mu
@@ -533,10 +554,8 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
             now = time.monotonic()
 
         # ── Advance phase accumulators ────────────────────────────────────────
-        # Must happen BEFORE the IMU read so cos/sin refs are current.
         for i in range(n):
             phis[i] += omegas[i] * dt
-            # Keep phi in [-π, π] to avoid floating-point drift over hours
             if phis[i] > math.pi:
                 phis[i] -= 2.0 * math.pi
 
@@ -557,23 +576,19 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                 C = lms_coeffs[i][0]
                 S = lms_coeffs[i][1]
 
-                # Amplitude / phase updates
                 lms_coeffs[i][0] -= mu * e * cos_ref
                 lms_coeffs[i][1] -= mu * e * sin_ref
 
-                # Frequency update
                 if mu_omega > 0:
-                    quad = S * cos_ref - C * sin_ref   # quadrature signal
+                    quad = S * cos_ref - C * sin_ref
                     omegas[i] -= mu_omega * e * quad
-
-                    # Clamp ω to [min_freq, max_freq] band
                     f_hz = omegas[i] / (2.0 * math.pi)
                     f_hz = max(args.min_freq, min(args.max_freq, f_hz))
                     omegas[i] = 2.0 * math.pi * f_hz
 
-            clamp_coeffs(lms_coeffs, args.max_amp_per_tone, args.max_total_amp)
+            # Each tone clamped to its own sps-derived limit
+            clamp_coeffs(lms_coeffs, per_tone_max_amp, args.max_total_amp)
 
-            # Publish adapted frequencies for main loop + status thread
             for i in range(n):
                 lms_freqs[i] = omegas[i] / (2.0 * math.pi)
 
@@ -602,9 +617,8 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
-                     args, running, init_freqs, lms_stats):
-    """Periodic status print + pigpiod keepalive.
-    Shows tracked (adapted) frequency alongside amplitude and phase."""
+                     args, running, init_freqs, lms_stats, per_tone_max_amp):
+    """Periodic status print + pigpiod keepalive."""
     if args.status_hz <= 0:
         return
 
@@ -628,9 +642,7 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
             with shared_lock:
                 sh = dict(shared)
 
-            # Use tracked frequencies from lms_stats if available
             tracked_freqs = lms_stats.get('freqs', init_freqs)
-
             total_A = sum(math.sqrt(cs[0] ** 2 + cs[1] ** 2) for cs in snap)
             print(
                 f"\nt={sh.get('t', 0):7.3f}s  "
@@ -643,10 +655,12 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
                 A      = math.sqrt(C ** 2 + S ** 2)
                 phi    = math.degrees(math.atan2(C, S))
                 f_now  = tracked_freqs[i] if i < len(tracked_freqs) else f_init
-                # Show tracked frequency; mark with * if it has drifted > 0.05 Hz
+                limit  = (per_tone_max_amp[i]
+                          if isinstance(per_tone_max_amp, (list, tuple))
+                          else per_tone_max_amp)
                 drift_marker = "*" if abs(f_now - f_init) > 0.05 else " "
                 print(f"  tone{i+1}  {f_now:.3f}Hz{drift_marker} "
-                      f"A={A:.3f}mm  φ={phi:+.1f}°  "
+                      f"A={A:.3f}mm (max {limit:.1f}mm)  φ={phi:+.1f}°  "
                       f"C={C:+.4f}  S={S:+.4f}")
 
             next_p += period
@@ -657,17 +671,16 @@ def status_thread_fn(pi, lms_coeffs, lms_lock, shared, shared_lock,
 # Phase 2 — Cancellation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_cancellation(pi, tones, args, k):
+def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     """
     Initialises LMS coefficients, starts LMS and status threads,
     then runs the DMA double-buffer stepper loop.
 
-    lms_freqs is a shared mutable list that the LMS thread updates
-    as ω adapts.  The main loop reads lms_freqs at each chunk boundary
-    and passes the adapted frequency to compute_chunk so the DMA waveform
-    always matches the current LMS reference signal.
-
-    log_buf accumulates (t, e, C, S, f) at --log_hz rate for post-run plotting.
+    per_tone_max_amp : list of float
+        Per-tone amplitude limits (mm), one per tone.  Computed in main()
+        as min(--max_amp_per_tone, sps-derived limit for that tone's frequency).
+        Each tone is clamped independently so low-frequency tones are not
+        penalised by the tighter constraint that applies to high-frequency tones.
     """
     print(f"\n{'─'*56}")
     print(f"  PHASE 2 — CANCEL")
@@ -675,26 +688,28 @@ def run_cancellation(pi, tones, args, k):
 
     pi.wave_clear()
 
-    F_init = [f for f, _ in tones]   # identified frequencies (fixed reference)
+    F_init = [f for f, _ in tones]
     n      = len(F_init)
 
     mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
     freq_tracking = mu_omega > 0
-    print(f"  Frequency tracking: {'ON  (µ_omega=' + str(mu_omega) + ')' if freq_tracking else 'OFF'}")
+    print(f"  Frequency tracking: "
+          f"{'ON  (µ_omega=' + str(mu_omega) + ')' if freq_tracking else 'OFF'}")
 
     # ── Initialise LMS coefficients ───────────────────────────────────────────
     lms_coeffs = []
-    for f, accel_amp in tones:
+    for i, (f, accel_amp) in enumerate(tones):
         if args.init_amp_gain > 0 and accel_amp > 0:
             disp_mm = accel_amp / (2 * math.pi * f) ** 2 * 1000
-            A_init  = min(disp_mm * args.init_amp_gain, args.max_amp_per_tone)
+            A_init  = min(disp_mm * args.init_amp_gain, per_tone_max_amp[i])
             lms_coeffs.append([A_init, 0.0])
         else:
             lms_coeffs.append([0.0, 0.0])
 
-    # Shared mutable frequency list — LMS thread writes, main loop reads
     lms_freqs = list(F_init)
 
+    print(f"  Per-tone amplitude limits (mm): "
+          f"{[f'{v:.2f}' for v in per_tone_max_amp]}")
     print(f"  Initial amplitudes:")
     for i, (f, cs) in enumerate(zip(F_init, lms_coeffs)):
         A_i = math.sqrt(cs[0] ** 2 + cs[1] ** 2)
@@ -712,7 +727,7 @@ def run_cancellation(pi, tones, args, k):
     pi.set_mode(args.dir,   pigpio.OUTPUT)
     pi.set_mode(args.step,  pigpio.OUTPUT)
     pi.set_mode(ENABLE_PIN, pigpio.OUTPUT)
-    pi.write(ENABLE_PIN, 1)
+    pi.write(ENABLE_PIN, 1)   # enable backstop interlock
     pi.wave_clear()
 
     pi.write(args.dir, 1)
@@ -724,7 +739,8 @@ def run_cancellation(pi, tones, args, k):
     lms_t = threading.Thread(
         target=lms_thread_fn,
         args=(F_init, lms_coeffs, lms_freqs, lms_lock,
-              t_wall_start, args, running, lms_stats, log_buf),
+              t_wall_start, args, running, lms_stats, log_buf,
+              per_tone_max_amp),
         daemon=True,
         name="lms-imu",
     )
@@ -733,7 +749,7 @@ def run_cancellation(pi, tones, args, k):
     stat_t = threading.Thread(
         target=status_thread_fn,
         args=(pi, lms_coeffs, lms_lock, shared, shared_lock,
-              args, running, F_init, lms_stats),
+              args, running, F_init, lms_stats, per_tone_max_amp),
         daemon=True,
         name="status",
     )
@@ -750,8 +766,7 @@ def run_cancellation(pi, tones, args, k):
     )
     print(f"\n  µ={args.mu}  µ_omega={mu_omega}  "
           f"control_fs={args.control_fs:.0f}Hz  chunk={chunk_s*1000:.0f}ms")
-    print(f"  max_amp_per_tone={args.max_amp_per_tone}mm  "
-          f"max_total_amp={args.max_total_amp}mm")
+    print(f"  max_total_amp={args.max_total_amp}mm")
     print(f"  Tones: {[f'{f:.3f}Hz' for f in F_init]}")
     print(f"  Est. initial peak sps: {est_peak_sps:.0f}")
     print(f"  Logging at {args.log_hz:.0f} Hz → plot_out={args.plot_out}")
@@ -776,15 +791,19 @@ def run_cancellation(pi, tones, args, k):
     t_chunk_wall = time.monotonic()
 
     # ── Double-buffer main loop ───────────────────────────────────────────────
+    #
+    #   While chunk N plays via DMA, Python computes chunk N+1.
+    #   Once N finishes: delete N, add N+1, send N+1 immediately.
+    #   Only one waveform occupies the CB pool at a time.
+    #
     try:
         while True:
             if t_end_wall and time.monotonic() >= t_end_wall:
                 break
 
-            # Snapshot LMS state — coefficients AND adapted frequencies
             with lms_lock:
                 A, PHI = coeffs_to_aphi(lms_coeffs)
-                F_cur  = list(lms_freqs)   # ← adapted frequency for chunk
+                F_cur  = list(lms_freqs)
 
             pulses_n, dir_n, t_next, steps_n = compute_chunk(
                 t_phase, chunk_s, A, F_cur, PHI, k,
@@ -809,7 +828,8 @@ def run_cancellation(pi, tones, args, k):
                     f"exceeds ±{HALF_TRAVEL_MM}mm"
                 )
 
-            # Free CBs before allocating next wave
+            # Delete current waveform before adding next — keeps CB pool at
+            # single-waveform occupancy, preventing CB exhaustion at high sps.
             pi.wave_delete(wave_c)
             pi.wave_add_generic(pulses_n)
             wave_n = pi.wave_create()
@@ -862,7 +882,6 @@ def run_cancellation(pi, tones, args, k):
             print(f"  tone{i+1}  {f_final:.3f}Hz (init {f_init:.3f}Hz)  "
                   f"A={A:.3f}mm  φ={phi:+.1f}°")
 
-        # ── Post-run convergence plot ─────────────────────────────────────────
         if not args.no_plot:
             print("\nGenerating convergence plot...")
             plot_run(log_buf['t'], log_buf['e'], log_buf['C'],
@@ -901,7 +920,7 @@ def main():
     print(f"  µ_omega    = {mu_omega}  "
           f"({'tracking ON' if mu_omega > 0 else 'tracking OFF'})")
 
-    # ── Phase 1: Identify ────────────────────────────────────────────────────
+    # ── Phase 1: Identify ─────────────────────────────────────────────────────
     if args.skip_id:
         if not args.manual_freqs:
             sys.exit("ERROR: --skip_id requires at least one --manual_freqs value.")
@@ -918,23 +937,32 @@ def main():
                 f"Try longer --id_dur, wider band, or --simulate."
             )
 
-    # ── Validate tones against hardware limits ───────────────────────────────
+    # ── Compute per-tone amplitude limits ─────────────────────────────────────
+    #
+    #   Each tone's limit = min(--max_amp_per_tone, sps-safe limit for that f).
+    #   Computed independently per tone so a high-frequency tone's tighter sps
+    #   constraint does not reduce the limit for lower-frequency tones.
+    #   The global args.max_amp_per_tone is never mutated.
+    #
+    per_tone_max_amp = []
     for f, _ in tones:
-        peak_sps = args.max_amp_per_tone * 2 * math.pi * f * k
-        if peak_sps > args.max_sps:
+        sps_at_max = args.max_amp_per_tone * 2 * math.pi * f * k
+        if sps_at_max > args.max_sps:
             safe_amp = args.max_sps / (2 * math.pi * f * k) * 0.95
-            print(f"  WARNING: {f:.2f}Hz — max_amp_per_tone reduced to "
-                  f"{safe_amp:.1f}mm (max_sps={args.max_sps:.0f} limit)")
-            args.max_amp_per_tone = min(args.max_amp_per_tone, safe_amp)
+            print(f"  WARNING: {f:.2f}Hz — amp limit for this tone set to "
+                  f"{safe_amp:.2f}mm  (sps constraint; other tones unaffected)")
+            per_tone_max_amp.append(safe_amp)
+        else:
+            per_tone_max_amp.append(args.max_amp_per_tone)
 
-    # ── Phase 2: Cancel ──────────────────────────────────────────────────────
+    # ── Phase 2: Cancel ───────────────────────────────────────────────────────
     pi = pigpio.pi()
     if not pi.connected:
         sys.exit("ERROR: pigpiod not running.  "
                  "Start with:  sudo systemctl start pigpiod")
 
     try:
-        run_cancellation(pi, tones, args, k)
+        run_cancellation(pi, tones, args, k, per_tone_max_amp)
     finally:
         pi.stop()
 
