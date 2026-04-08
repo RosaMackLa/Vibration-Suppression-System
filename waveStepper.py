@@ -212,7 +212,7 @@ def main():
     pi.set_mode(args.dir,  pigpio.OUTPUT)
     pi.set_mode(args.step, pigpio.OUTPUT)
     pi.set_mode(25, pigpio.OUTPUT)
-    pi.write(25, 0)   # enable hardware backstop interlock
+    pi.write(25, 1)   # enable hardware backstop interlock
     pi.wave_clear()
 
     # Set DIR pin to match initial velocity direction before first pulse
@@ -337,14 +337,14 @@ def main():
                     f"exceeds ±{HALF_TRAVEL_MM:.2f} mm."
                 )
 
+            # Free the waveform that just finished
+            pi.wave_delete(wave_id_curr)
+
             # ── Start next chunk immediately ──────────────────────────────
             pi.wave_add_generic(pulses_next)
             wave_id_next     = pi.wave_create()
             pi.wave_send_once(wave_id_next)
             chunk_wall_start = time.monotonic()
-
-            # Free the waveform that just finished
-            pi.wave_delete(wave_id_curr)
 
             # Push status (non-blocking: skip if bg thread holds lock)
             if status_lock.acquire(blocking=False):

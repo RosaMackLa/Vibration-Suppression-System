@@ -22,7 +22,7 @@ Key flags:
   --freqs      Space-separated list of test frequencies in Hz
   --settle     Cycles to discard per frequency (transient, default 4)
   --meas       Cycles to use for sine fitting (default 6)
-  --imu_addr   LSM6DSO I2C address in hex (default 0x6b)
+  --imu_addr   LSM6DSO I2C address in hex (default 0x6a)
   --out_dir    Output directory (default ./plant_id_out)
   --baseline   Measure IMU noise floor before sweep (recommended)
 
@@ -88,7 +88,7 @@ class IMUCapture:
     Timestamps via time.monotonic().
     """
 
-    def __init__(self, bus_num=1, addr=0x6B):
+    def __init__(self, bus_num=1, addr=0x6a):
         self.bus  = smbus2.SMBus(bus_num)
         self.addr = addr
         self._configure()
@@ -342,8 +342,8 @@ def parse_args():
                    help='Settling cycles per frequency (discarded, default 4)')
     p.add_argument('--meas', type=int, default=DEFAULT_MEAS,
                    help='Measurement cycles for sine fit (default 6)')
-    p.add_argument('--imu_addr', type=lambda x: int(x, 0), default=0x6B,
-                   help='LSM6DSO I2C address (default 0x6b)')
+    p.add_argument('--imu_addr', type=lambda x: int(x, 0), default=0x6A,
+                   help='LSM6DSO I2C address (default 0x6a)')
     p.add_argument('--out_dir', type=str, default='./plant_id_out')
     p.add_argument('--baseline', action='store_true',
                    help='Measure IMU noise floor before sweep (recommended)')
