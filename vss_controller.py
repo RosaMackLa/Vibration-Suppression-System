@@ -712,7 +712,7 @@ def run_cancellation(pi, tones, args, k):
     pi.set_mode(args.dir,   pigpio.OUTPUT)
     pi.set_mode(args.step,  pigpio.OUTPUT)
     pi.set_mode(ENABLE_PIN, pigpio.OUTPUT)
-    pi.write(ENABLE_PIN, 0)
+    pi.write(ENABLE_PIN, 1)
     pi.wave_clear()
 
     pi.write(args.dir, 1)
