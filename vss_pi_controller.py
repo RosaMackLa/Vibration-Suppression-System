@@ -4,69 +4,63 @@ vss_pi_controller.py — VSS velocity-error PI vibration suppression
 
 CONTROL LAW
 ───────────
-  Structural velocity is estimated by leaky integration of IMU x-axis
-  acceleration:
+  Structural velocity is estimated by leaky integration of bias-rejected
+  IMU x-axis acceleration.  A two-stage filter separates DC from vibration:
 
-      v_est[n] = v_est[n-1] * (1 - dt/τ) + a_imu[n] * dt
+    STAGE 1 — DC bias removal (slow moving average, time constant tau_dc):
+        a_mean[n] = a_mean[n-1] * (1 - dt/τ_dc) + a_imu[n] * (dt/τ_dc)
+        a_hp[n]   = a_imu[n] - a_mean[n]          ← AC-only acceleration
 
-  The leak term dt/τ (controlled by --tau_vel) prevents unbounded drift
-  from accelerometer DC bias.  Shorter τ → faster DC rejection but more
-  noise sensitivity.  Longer τ → smoother estimate but slower to reject DC.
+    STAGE 2 — Leaky velocity integration (time constant tau_vel):
+        v_est[n]  = v_est[n-1] * (1 - dt/τ_v) + a_hp[n] * dt
+
+  Without Stage 1, IMU tilt/bias (~0.05 m/s² DC) integrates into a
+  permanent velocity offset that drifts the carriage into the travel limit.
+  tau_dc should be much longer than the disturbance period (e.g. 2s for 9 Hz
+  disturbance at 0.11s period) so it passes the vibration cleanly.
 
   PI error (target = zero structural velocity):
-
       e_v(t) = v_est(t)
 
   PI output — carriage velocity command (mm/s):
-
       u(t) = −[ Kp · e_v(t) + Ki · ∫e_v dt ]
 
-  The negative sign commands the carriage to oppose structural velocity:
-  when the structure moves in the +x direction the carriage is driven in
-  the −x direction, creating an inertial reaction force that damps the
-  motion.  If the sign is wrong for your physical layout, use --dir_invert.
+  NOTE ON Kp UNITS:
+      v_est is in m/s.  vel_cmd is in mm/s.
+      So Kp has units of (mm/s) / (m/s) = 0.001 dimensionless.
+      At 8.8 Hz with 0.17 m/s² disturbance, v_amplitude ≈ 0.003 m/s.
+      Deadband threshold = deadband_sps / k ≈ 0.23 mm/s.
+      Minimum useful Kp ≈ 0.23 / 0.003 ≈ 77.  Start at 500.
 
-  Anti-windup: the integral is clamped to ±(max_vel_mm / Ki) so the
-  integrator alone can never saturate the output.
+  Anti-windup: integral clamped to ±(max_vel_mm / Ki).
 
 ACTUATION
 ─────────
-  The PI output is a signed velocity command (mm/s).  At each DMA chunk
+  PI output is a signed velocity command (mm/s).  At each DMA chunk
   boundary (~chunk_ms period) the command is converted to a constant step
   rate for that chunk.  chunk_ms defaults to 10 ms (100 Hz update rate),
-  which gives ~11 updates per cycle at 9 Hz.  Reduce further if you need
-  more bandwidth, but below ~5 ms the chunk computation overhead becomes
-  significant on the Pi.
+  giving ~11 waveform updates per cycle at 9 Hz.
 
 TUNING GUIDE
 ────────────
-  Start with Ki=0 and increase Kp only:
-    Kp too low  → carriage barely moves, no damping effect
-    Kp too high → carriage oscillates independently of disturbance
-  Typical starting point: Kp=0.5–2.0 depending on carriage mass vs structure.
+  tau_dc  : 2.0 s is a good default.  Leave it alone unless the carriage
+            drifts steadily in one direction (increase tau_dc) or the
+            controller is slow to respond to low-frequency changes (decrease).
 
-  Once Kp gives visible damping, add Ki slowly (start at Kp/20):
-    Ki too high → slow low-frequency oscillation, windup
+  tau_vel : 0.2–0.5 s.  Shorter = more responsive but noisier velocity
+            estimate.  0.3 s is a good starting point.
 
-  tau_vel:
-    0.1–0.2 s → fast response, noisy velocity estimate
-    0.3–0.5 s → balanced (good starting point)
-    1.0 s+    → smooth but sluggish at tracking velocity changes
+  Kp      : Start at 500.  Increase until carriage motion is clearly
+            visible and correlated with disturbance.  If carriage oscillates
+            independently of the disturbance, Kp is too high.
 
-  NOTE: --simulate only tests that the software runs without crashing.
-  It does not include a plant model so PI cancellation will not be visible
-  in simulation — the carriage moves but has no effect on the simulated error.
+  Ki      : Leave at 0 until Kp gives visible damping.  Then add slowly
+            (start at Kp/20) to remove any residual DC position drift.
 
 USAGE
 ─────
-  # Proportional only, start here:
   sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_pi_controller.py \\
-      --kp 1.0 --ki 0.0 --tau_vel 0.3 \\
-      --max_sps 50000 --max_vel_mm 50 --cancel_dur 120 --dir_invert
-
-  # Add integral once Kp is tuned:
-  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_pi_controller.py \\
-      --kp 1.0 --ki 0.05 --tau_vel 0.3 \\
+      --kp 500 --ki 0.0 --tau_vel 0.3 --tau_dc 2.0 \\
       --max_sps 50000 --max_vel_mm 50 --cancel_dur 120 --dir_invert
 """
 
@@ -158,12 +152,19 @@ def parse_args():
     hw.add_argument("--dir_blanking_us", type=int,   default=200)
 
     pi_g = p.add_argument_group("PI Controller")
-    pi_g.add_argument("--kp",         type=float, default=1.0,
-                      help="Proportional gain [(mm/s) / (m/s)]")
+    pi_g.add_argument("--kp",         type=float, default=500.0,
+                      help="Proportional gain [(mm/s) / (m/s)]. "
+                           "v_est is in m/s, vel_cmd in mm/s, so Kp=500 gives "
+                           "500mm/s per m/s of structural velocity.")
     pi_g.add_argument("--ki",         type=float, default=0.0,
-                      help="Integral gain [(mm/s) / (m/s·s)].  Start at 0.")
+                      help="Integral gain [(mm/s) / (m/s·s)]. Start at 0.")
     pi_g.add_argument("--tau_vel",    type=float, default=0.3,
-                      help="Leaky integrator time constant (s) for velocity estimate.")
+                      help="Leaky integrator time constant (s) for velocity "
+                           "estimate. Shorter = faster/noisier. 0.3s is a good start.")
+    pi_g.add_argument("--tau_dc",     type=float, default=2.0,
+                      help="DC bias removal time constant (s). Must be much longer "
+                           "than the disturbance period (e.g. 2s for 9Hz disturbance). "
+                           "Removes IMU tilt/bias before velocity integration.")
     pi_g.add_argument("--max_vel_mm", type=float, default=50.0,
                       help="Carriage velocity command clamp (mm/s).")
     pi_g.add_argument("--control_fs", type=float, default=800.0,
@@ -171,8 +172,8 @@ def parse_args():
 
     sim = p.add_argument_group("Simulation")
     sim.add_argument("--simulate", action="store_true",
-                     help="Use synthetic IMU signal (no plant model — "
-                          "tests software only, not control performance).")
+                     help="Use synthetic IMU signal. Tests software only — "
+                          "no plant model so PI damping will not be visible.")
 
     log = p.add_argument_group("Logging & Plotting")
     log.add_argument("--log_hz",   type=float, default=100.0,
@@ -201,11 +202,8 @@ def compute_chunk_vel(vel_cmd_mm_s, chunk_s, k,
     Generate a constant-velocity DMA chunk spanning exactly chunk_s seconds.
 
     vel_cmd_mm_s : signed carriage velocity command (mm/s).
-                   Sign determines direction; magnitude determines step rate.
-
-    The chunk is always exactly chunk_s long regardless of how many steps
-    fit — remaining time after the last step is padded with a delay pulse.
-    This ensures the double-buffer timing stays accurate.
+    The chunk is always exactly chunk_s long — remaining time after the last
+    step is padded with a delay pulse so the double-buffer timing stays accurate.
 
     Returns (pulses, end_dir, net_steps).
     net_steps is signed: positive = physical positive direction.
@@ -221,14 +219,14 @@ def compute_chunk_vel(vel_cmd_mm_s, chunk_s, k,
     net_steps   = 0
     elapsed_us  = 0
 
-    # Below deadband: emit a single delay to fill the chunk, no motion
+    # Below deadband: single delay pulse, no motion
     if sps < deadband_sps:
         pulses.append(pigpio.pulse(0, 0, chunk_us))
         return pulses, current_dir, 0
 
     logical_dir = (1 if vel_cmd_mm_s >= 0.0 else 0) ^ int(dir_invert)
 
-    # Direction change — insert blanking + setup delays, track elapsed time
+    # Direction change — blanking + setup, track elapsed
     if logical_dir != current_dir:
         if dir_blanking_us > 0:
             d = min(dir_blanking_us, chunk_us - elapsed_us)
@@ -245,23 +243,21 @@ def compute_chunk_vel(vel_cmd_mm_s, chunk_s, k,
             elapsed_us += d
             current_dir = logical_dir
 
-    # Fill remaining chunk time with constant-rate steps
+    # Fill remaining time with constant-rate steps
     period_us = max(MIN_PERIOD_US, int(round(1e6 / sps)))
-
     while elapsed_us + period_us <= chunk_us:
         pulses.append(pigpio.pulse(STEP_BIT, 0, PULSE_HIGH_US))
         pulses.append(pigpio.pulse(0, STEP_BIT, period_us - PULSE_HIGH_US))
         elapsed_us += period_us
         net_steps  += 1
 
-    # Pad remainder so chunk is exactly chunk_us long
+    # Pad remainder to exact chunk length
     remainder = chunk_us - elapsed_us
     if remainder > 0:
         pulses.append(pigpio.pulse(0, 0, remainder))
 
-    # Sign net_steps by physical direction
-    phys_dir   = current_dir ^ int(dir_invert)
-    net_steps  = net_steps if phys_dir else -net_steps
+    phys_dir  = current_dir ^ int(dir_invert)
+    net_steps = net_steps if phys_dir else -net_steps
 
     return pulses, current_dir, net_steps
 
@@ -277,29 +273,33 @@ def pi_thread_fn(pi_state, pi_lock, t_start, args, running, pi_stats, log_buf):
     """
     Runs at ~control_fs Hz.
 
-    STEP 1 — Leaky velocity integration:
-        v_est[n] = v_est[n-1] * (1 - dt/τ) + a_imu[n] * dt
+    STAGE 1 — DC bias removal:
+        a_mean tracks the slow DC component of a_imu with time constant tau_dc.
+        a_hp = a_imu - a_mean strips it out before integration.
+        This prevents IMU tilt/bias (~0.05 m/s² typical) from integrating
+        into a permanent velocity offset that drifts the carriage.
 
-    STEP 2 — PI control (error = structural velocity, target = 0):
-        integral += e_v * dt              (anti-windup clamped)
-        u = −(Kp·e_v + Ki·integral)       (negative = oppose velocity)
-        u = clamp(u, ±max_vel_mm)
+    STAGE 2 — Leaky velocity integration:
+        v_est = v_est * (1 - dt/tau_vel) + a_hp * dt
 
-    STEP 3 — Publish u to pi_state['vel_cmd'] under pi_lock so the main
-              DMA loop can snapshot it at each chunk boundary.
+    STAGE 3 — PI control:
+        error   = v_est           (target: zero structural velocity)
+        integral += error * dt    (anti-windup clamped)
+        vel_cmd = -(Kp*error + Ki*integral)
+        vel_cmd clamped to ±max_vel_mm
 
-    Anti-windup clamp:
-        |integral| ≤ max_vel_mm / Ki
-    This ensures the integrator alone can never saturate the output,
-    preventing slow recovery after the carriage hits a travel limit.
+    The negative sign commands the carriage to oppose structural velocity.
+    If the sign is wrong for your physical layout, use --dir_invert.
     """
     dt      = 1.0 / args.control_fs
     leak    = dt / max(args.tau_vel, 1e-6)
+    dc_leak = dt / max(args.tau_dc,  1e-6)
     kp      = args.kp
     ki      = args.ki
     max_vel = args.max_vel_mm
 
     v_est    = 0.0
+    a_mean   = 0.0   # running DC estimate of a_imu
     integral = 0.0
     max_integral = (max_vel / ki) if ki > 1e-12 else float('inf')
 
@@ -313,18 +313,20 @@ def pi_thread_fn(pi_state, pi_lock, t_start, args, running, pi_stats, log_buf):
             time.sleep(next_t - now)
             now = time.monotonic()
 
-        # Read IMU acceleration
+        # Read IMU
         if args.simulate:
-            a = sim_disturbance(now - t_start)
+            a_imu = sim_disturbance(now - t_start)
         else:
-            a = hw_read_accel()
+            a_imu = hw_read_accel()
 
-        # Leaky velocity integration
-        a_mean = a_mean * (1.0 - dt / tau_dc) + a * (dt / tau_dc)
-        a_hp   = a - a_mean                    # DC-rejected acceleration
-        v_est  = v_est * (1.0 - leak) + a_hp * dt
+        # Stage 1: DC bias removal
+        a_mean = a_mean * (1.0 - dc_leak) + a_imu * dc_leak
+        a_hp   = a_imu - a_mean
 
-        # PI on velocity error
+        # Stage 2: Leaky velocity integration on bias-free signal
+        v_est = v_est * (1.0 - leak) + a_hp * dt
+
+        # Stage 3: PI control
         e_v      = v_est
         integral = max(-max_integral, min(max_integral, integral + e_v * dt))
         vel_cmd  = -(kp * e_v + ki * integral)
@@ -333,18 +335,21 @@ def pi_thread_fn(pi_state, pi_lock, t_start, args, running, pi_stats, log_buf):
         with pi_lock:
             pi_state['vel_cmd'] = vel_cmd
             pi_state['v_est']   = v_est
-            pi_state['a_imu']   = a
+            pi_state['a_imu']   = a_imu
+            pi_state['a_hp']    = a_hp
 
         pi_stats['v_est']   = v_est
         pi_stats['vel_cmd'] = vel_cmd
-        pi_stats['a_imu']   = a
+        pi_stats['a_imu']   = a_imu
+        pi_stats['a_hp']    = a_hp
         pi_stats['t']       = now - t_start
 
         log_ticker += 1
         if log_ticker >= log_every:
             log_ticker = 0
             log_buf['t'].append(now - t_start)
-            log_buf['a'].append(a)
+            log_buf['a'].append(a_imu)
+            log_buf['a_hp'].append(a_hp)
             log_buf['v'].append(v_est)
             log_buf['u'].append(vel_cmd)
 
@@ -380,6 +385,7 @@ def status_thread_fn(pi_hw, shared, shared_lock, args, running, pi_stats):
                 f"t={sh.get('t', 0):7.3f}s  "
                 f"x_est={sh.get('x_est', 0):+7.2f}mm  "
                 f"a_imu={pi_stats.get('a_imu', 0):+.4f} m/s²  "
+                f"a_hp={pi_stats.get('a_hp', 0):+.4f} m/s²  "
                 f"v_est={pi_stats.get('v_est', 0):+.5f} m/s  "
                 f"vel_cmd={pi_stats.get('vel_cmd', 0):+6.2f} mm/s"
             )
@@ -393,65 +399,78 @@ def status_thread_fn(pi_hw, shared, shared_lock, args, running, pi_stats):
 
 def plot_run(log_buf, args):
     """
-    3-panel post-run plot:
-      Panel 1 — IMU acceleration + 2s RMS envelope
-      Panel 2 — Estimated structural velocity (the PI error signal) + 2s RMS
-      Panel 3 — PI velocity command output
+    4-panel post-run plot:
+      Panel 1 — Raw IMU acceleration + RMS envelope
+      Panel 2 — DC-rejected acceleration (what actually gets integrated)
+      Panel 3 — Estimated structural velocity (PI error signal) + RMS
+      Panel 4 — PI velocity command output
     """
     n = len(log_buf['t'])
     if n < 2:
         print("  Not enough data to plot.")
         return
 
-    t = np.array(log_buf['t'])
-    a = np.array(log_buf['a'])
-    v = np.array(log_buf['v'])
-    u = np.array(log_buf['u'])
+    t    = np.array(log_buf['t'])
+    a    = np.array(log_buf['a'])
+    a_hp = np.array(log_buf['a_hp'])
+    v    = np.array(log_buf['v'])
+    u    = np.array(log_buf['u'])
 
     window = max(1, int(2.0 * args.log_hz))
 
-    def rms_envelope(x):
+    def rms_env(x):
         return np.array([
             np.sqrt(np.mean(x[max(0, i - window):i + 1] ** 2))
             for i in range(len(x))
         ])
 
-    a_rms = rms_envelope(a)
-    v_rms = rms_envelope(v)
-
-    fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
     fig.suptitle(
         f"VSS PI Controller\n"
-        f"Kp={args.kp}  Ki={args.ki}  τ_vel={args.tau_vel}s  "
+        f"Kp={args.kp}  Ki={args.ki}  "
+        f"τ_vel={args.tau_vel}s  τ_dc={args.tau_dc}s  "
         f"fs={args.control_fs:.0f}Hz  chunk={args.chunk_ms:.0f}ms  "
         f"dur={t[-1]:.1f}s",
         fontsize=10,
     )
 
-    # Panel 1 — IMU acceleration
+    # Panel 1 — Raw IMU acceleration
     ax = axes[0]
     ax.plot(t, a, alpha=0.25, color='gray', linewidth=0.4, label='a_imu(t)')
-    ax.plot(t, a_rms, color='crimson', linewidth=1.5, label='a_rms (2s window)')
+    ax.plot(t, rms_env(a), color='crimson', linewidth=1.5,
+            label='a_rms (2s window)')
     ax.axhline(0, color='black', linewidth=0.5)
-    ax.set_ylabel('Acceleration [m/s²]')
-    ax.set_title('IMU Acceleration  (should fall if PI is damping effectively)')
+    ax.set_ylabel('Accel [m/s²]')
+    ax.set_title('Raw IMU Acceleration  (should fall if PI is damping effectively)')
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Panel 2 — Estimated structural velocity (PI error signal)
+    # Panel 2 — DC-rejected acceleration
     ax = axes[1]
+    ax.plot(t, a_hp, alpha=0.3, color='darkorange', linewidth=0.4,
+            label='a_hp(t)  (DC removed)')
+    ax.plot(t, rms_env(a_hp), color='saddlebrown', linewidth=1.5,
+            label='a_hp_rms (2s window)')
+    ax.axhline(0, color='black', linewidth=0.5)
+    ax.set_ylabel('Accel [m/s²]')
+    ax.set_title('DC-Rejected Acceleration  (what gets integrated into v_est)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3 — Estimated structural velocity
+    ax = axes[2]
     ax.plot(t, v * 1000, alpha=0.4, color='steelblue', linewidth=0.5,
             label='v_est(t)  [mm/s]')
-    ax.plot(t, v_rms * 1000, color='navy', linewidth=1.5,
+    ax.plot(t, rms_env(v) * 1000, color='navy', linewidth=1.5,
             label='v_rms (2s window)  [mm/s]')
     ax.axhline(0, color='black', linewidth=0.5)
     ax.set_ylabel('Velocity [mm/s]')
-    ax.set_title('Estimated Structural Velocity  (PI error — target = 0)')
+    ax.set_title('Estimated Structural Velocity  (PI error signal — target = 0)')
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Panel 3 — PI velocity command
-    ax = axes[2]
+    # Panel 4 — PI velocity command
+    ax = axes[3]
     ax.plot(t, u, color='seagreen', linewidth=0.8, label='vel_cmd (mm/s)')
     ax.axhline( args.max_vel_mm, color='red', linestyle='--', linewidth=0.8,
                 label=f'+clamp = {args.max_vel_mm} mm/s')
@@ -477,7 +496,8 @@ def run_cancellation(pi_hw, args, k):
     print(f"\n{'─'*56}")
     print(f"  PI VELOCITY CONTROLLER")
     print(f"{'─'*56}")
-    print(f"  Kp={args.kp}  Ki={args.ki}  τ_vel={args.tau_vel}s")
+    print(f"  Kp={args.kp}  Ki={args.ki}  "
+          f"τ_vel={args.tau_vel}s  τ_dc={args.tau_dc}s")
     print(f"  max_vel_cmd={args.max_vel_mm} mm/s  "
           f"control_fs={args.control_fs:.0f}Hz  chunk={args.chunk_ms}ms")
     print(f"  Ctrl-C to stop.\n")
@@ -487,22 +507,21 @@ def run_cancellation(pi_hw, args, k):
     pi_hw.set_mode(args.dir,   pigpio.OUTPUT)
     pi_hw.set_mode(args.step,  pigpio.OUTPUT)
     pi_hw.set_mode(ENABLE_PIN, pigpio.OUTPUT)
-    pi_hw.write(ENABLE_PIN, 1)   # enable backstop interlock
+    pi_hw.write(ENABLE_PIN, 1)
     pi_hw.write(args.dir, 1)
     time.sleep(args.dir_setup_us / 1e6)
 
     t_wall_start = time.monotonic()
 
-    pi_state    = {'vel_cmd': 0.0, 'v_est': 0.0, 'a_imu': 0.0}
+    pi_state    = {'vel_cmd': 0.0, 'v_est': 0.0, 'a_imu': 0.0, 'a_hp': 0.0}
     pi_lock     = threading.Lock()
     running     = [True]
-    pi_stats    = {'v_est': 0.0, 'vel_cmd': 0.0, 'a_imu': 0.0, 't': 0.0}
+    pi_stats    = {'v_est': 0.0, 'vel_cmd': 0.0, 'a_imu': 0.0, 'a_hp': 0.0, 't': 0.0}
     shared      = {'t': 0.0, 'x_est': 0.0}
     shared_lock = threading.Lock()
-    log_buf     = {'t': [], 'a': [], 'v': [], 'u': []}
+    log_buf     = {'t': [], 'a': [], 'a_hp': [], 'v': [], 'u': []}
     chunk_s     = args.chunk_ms / 1000.0
 
-    # ── Spawn control and status threads ──────────────────────────────────────
     ctrl_t = threading.Thread(
         target=pi_thread_fn,
         args=(pi_state, pi_lock, t_wall_start, args, running, pi_stats, log_buf),
@@ -521,7 +540,7 @@ def run_cancellation(pi_hw, args, k):
     last_dir   = 1
     t_end_wall = (t_wall_start + args.cancel_dur) if args.cancel_dur > 0 else None
 
-    # ── Bootstrap first chunk ─────────────────────────────────────────────────
+    # Bootstrap first chunk
     with pi_lock:
         vel_cmd = pi_state['vel_cmd']
 
@@ -538,17 +557,14 @@ def run_cancellation(pi_hw, args, k):
     pi_hw.wave_send_once(wave_c)
     t_chunk_wall = time.monotonic()
 
-    # ── Double-buffer main loop ───────────────────────────────────────────────
-    #
-    #   While chunk N plays via DMA, snapshot PI output and compute chunk N+1.
-    #   Once N finishes: delete N (free CBs), add N+1, send N+1 immediately.
-    #
+    # Double-buffer main loop
+    # While chunk N plays via DMA, snapshot PI output and compute chunk N+1.
+    # Delete N before adding N+1 — keeps CB pool at single-waveform occupancy.
     try:
         while True:
             if t_end_wall and time.monotonic() >= t_end_wall:
                 break
 
-            # Snapshot latest PI velocity command for next chunk
             with pi_lock:
                 vel_cmd = pi_state['vel_cmd']
 
@@ -560,14 +576,12 @@ def run_cancellation(pi_hw, args, k):
             )
             dur_n = wave_dur_s(pulses_n) or chunk_s
 
-            # Sleep until ~5ms before chunk ends, then busy-poll
             sleep_s = dur_c - (time.monotonic() - t_chunk_wall) - 0.005
             if sleep_s > 0:
                 time.sleep(sleep_s)
             while pi_hw.wave_tx_busy():
                 time.sleep(0.0001)
 
-            # Update position with exact step count from completed chunk
             s_est += steps_c
             x_est  = s_est / k
 
@@ -577,7 +591,6 @@ def run_cancellation(pi_hw, args, k):
                     f"exceeds ±{HALF_TRAVEL_MM}mm"
                 )
 
-            # Delete current waveform before adding next (single CB pool occupancy)
             pi_hw.wave_delete(wave_c)
             pi_hw.wave_add_generic(pulses_n)
             wave_n = pi_hw.wave_create()
@@ -643,9 +656,17 @@ def main():
     print(f"  steps/mm  = {k:.4f}")
     print(f"  ±travel   = {HALF_TRAVEL_MM:.1f}mm  (≈{HALF_TRAVEL_MM * k:.0f} steps)")
     print(f"  simulate  = {args.simulate}")
-    print(f"  Kp={args.kp}  Ki={args.ki}  τ_vel={args.tau_vel}s")
+    print(f"  Kp={args.kp}  Ki={args.ki}  "
+          f"τ_vel={args.tau_vel}s  τ_dc={args.tau_dc}s")
     print(f"  max_vel   = {args.max_vel_mm}mm/s  "
           f"chunk={args.chunk_ms}ms  control_fs={args.control_fs:.0f}Hz")
+    print()
+    min_useful_kp = args.deadband_sps / k / (args.max_vel_mm / args.kp
+                    if args.kp > 0 else 1)
+    print(f"  Deadband threshold = {args.deadband_sps/k:.3f} mm/s")
+    print(f"  At Kp={args.kp}: vel_cmd saturates at "
+          f"v_est = {args.max_vel_mm/args.kp*1000:.2f} mm/s = "
+          f"{args.max_vel_mm/args.kp:.5f} m/s")
 
     pi_hw = pigpio.pi()
     if not pi_hw.connected:
