@@ -320,7 +320,9 @@ def pi_thread_fn(pi_state, pi_lock, t_start, args, running, pi_stats, log_buf):
             a = hw_read_accel()
 
         # Leaky velocity integration
-        v_est = v_est * (1.0 - leak) + a * dt
+        a_mean = a_mean * (1.0 - dt / tau_dc) + a * (dt / tau_dc)
+        a_hp   = a - a_mean                    # DC-rejected acceleration
+        v_est  = v_est * (1.0 - leak) + a_hp * dt
 
         # PI on velocity error
         e_v      = v_est
