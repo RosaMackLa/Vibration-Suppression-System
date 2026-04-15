@@ -354,7 +354,7 @@ def main():
     phi_p_deg = math.degrees(phi_p)
 
     # Plant gain: (m/s² per mm of commanded displacement)
-    G = A_meas / args.amp
+    G = A_meas / args.amp if args.amp > 0 else float("nan")
 
     # SNR: signal power vs residual power
     sig_power = 0.5 * A_meas ** 2
