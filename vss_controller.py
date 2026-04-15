@@ -33,8 +33,27 @@ ARCHITECTURE
 ────────────
   Main thread   : DMA double-buffer loop — reads latest (C, S, ω) at every
                   chunk boundary and passes adapted frequency to compute_chunk
-  LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp → log
+  LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp → log;
+                  also pushes IMU samples into a ring buffer for the FFT thread
+  FFT thread    : --fft_tracker only — every --fft_update_sec, computes a
+                  Hann-windowed FFT over the ring buffer, finds the dominant
+                  peak in [min_freq, max_freq] with parabolic interpolation,
+                  and writes the result into the shared frequency state.
+                  When the FFT tracker is active, the gradient ω update in
+                  the LMS thread is automatically disabled to maintain a
+                  single-writer invariant on the frequency state.
   Status thread : ~status_hz Hz print (shows tracked frequency) + keepalive
+
+PHASE FRAME — historical fix
+────────────────────────────
+  Earlier versions of compute_chunk used absolute time `t` for stepper
+  phase: cos(2π·F·t + PHI).  This created a phase discontinuity of
+  2π·ΔF·t at every chunk boundary where ω changed — manageable for the
+  gradient tracker's microscopic ω updates, catastrophic for the FFT
+  tracker (a 0.05 Hz step at t=60s = 6 full rotations of misalignment).
+  Fixed: compute_chunk now maintains a per-tone phase accumulator
+  (step_phis) that evolves identically to the LMS phi accumulator.
+  When ω changes, evolution rate changes but accumulated phase does not.
 
 AMPLITUDE CLAMPING
 ──────────────────
@@ -77,6 +96,7 @@ import time
 import threading
 import sys
 import random
+from collections import deque
 
 import numpy as np
 import matplotlib
@@ -209,6 +229,28 @@ def parse_args():
     lms.add_argument("--max_total_amp",    type=float, default=60.0)
     lms.add_argument("--init_amp_gain",    type=float, default=0.0)
     lms.add_argument("--cancel_dur",       type=float, default=0.0)
+
+    # ── FFT frequency tracker ─────────────────────────────────────────────────
+    fft = p.add_argument_group("FFT Frequency Tracker")
+    fft.add_argument("--fft_tracker",     action="store_true",
+                     help="Enable the parallel FFT-based frequency tracker. "
+                          "When ON, the gradient ω update in the LMS thread is "
+                          "automatically disabled (single-writer invariant).")
+    fft.add_argument("--fft_window_sec",  type=float, default=2.0,
+                     help="FFT window length [s]. Larger = finer resolution, "
+                          "slower response. 2.0s gives ~0.5 Hz bin width with "
+                          "parabolic interpolation reaching ~0.01-0.05 Hz.")
+    fft.add_argument("--fft_update_sec",  type=float, default=1.0,
+                     help="How often the FFT thread recomputes (s). Should be "
+                          "≥ fft_window_sec/2 to avoid correlated estimates.")
+    fft.add_argument("--fft_max_step_hz", type=float, default=0.05,
+                     help="Maximum frequency change per FFT update [Hz]. "
+                          "Limits per-update phase jumps in compute_chunk "
+                          "(see KNOWN ISSUE in module docstring).")
+    fft.add_argument("--fft_band_pad_hz", type=float, default=1.0,
+                     help="The FFT search band is [f_initial - pad, "
+                          "f_initial + pad] for each tone. Keeps tracker from "
+                          "wandering into resonances or harmonics.")
 
     # ── Simulation ────────────────────────────────────────────────────────────
     sim = p.add_argument_group("Simulation")
@@ -457,10 +499,27 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
 def compute_chunk(t_start, chunk_s, A, F, PHI, k,
                   max_sps, deadband_sps,
                   step_pin, dir_pin, last_dir, dir_invert,
-                  dir_blanking_us, dir_setup_us):
+                  dir_blanking_us, dir_setup_us,
+                  step_phis):
     """
     Build one DMA waveform chunk covering [t_start, t_start + chunk_s).
     Returns (pulses, end_dir, t_end, net_steps).
+
+    PHASE FRAME — fixes the absolute-time phase bug
+    ────────────────────────────────────────────────
+    Earlier versions evaluated  cos(2π·F·t + PHI)  using absolute time t.
+    When F changes between chunks (FFT tracker, gradient tracker), the
+    stepper's commanded phase jumps by  2π·ΔF·t  while the LMS's own phase
+    accumulator continues smoothly.  Result: every frequency update
+    re-randomizes the cancellation alignment.
+
+    Fix: step_phis is a per-tone phase accumulator that evolves identically
+    to the LMS phi accumulator (φ += ω·dt per substep).  It persists across
+    chunk calls.  When F changes, step_phis continues from where it was —
+    only the *rate* of evolution changes, never the value.
+
+    step_phis is mutated IN PLACE.  Caller must initialise once (zeros) and
+    pass the same list to every compute_chunk call.
     """
     STEP_BIT      = 1 << step_pin
     DIR_BIT       = 1 << dir_pin
@@ -472,17 +531,29 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
     current_dir = last_dir
     net_steps   = 0
 
+    n_tones = len(A)
+    omegas  = [2.0 * math.pi * F[i] for i in range(n_tones)]
+
+    def advance_phases(dt):
+        for i in range(n_tones):
+            step_phis[i] += omegas[i] * dt
+            if step_phis[i] > math.pi:
+                step_phis[i] -= 2.0 * math.pi
+
     while t < t_end:
+        # NOTE: cos(step_phis[i] + PHI[i]), NOT cos(2π·F·t + PHI)
         v = sum(
-            A[i] * (2.0 * math.pi * F[i]) * math.cos(2.0 * math.pi * F[i] * t + PHI[i])
-            for i in range(len(A)) if A[i] and F[i]
+            A[i] * omegas[i] * math.cos(step_phis[i] + PHI[i])
+            for i in range(n_tones) if A[i] and F[i]
         )
         sps = min(abs(v) * k, max_sps)
 
         if sps < deadband_sps:
             wait_us = min(1000, max(1, int((t_end - t) * 1e6)))
             pulses.append(pigpio.pulse(0, 0, wait_us))
-            t += wait_us / 1e6
+            dt = wait_us / 1e6
+            advance_phases(dt)
+            t += dt
             continue
 
         logical_dir = int(v >= 0.0) ^ int(dir_invert)
@@ -494,6 +565,9 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
                 0       if logical_dir else DIR_BIT,
                 dir_setup_us,
             ))
+            # NOTE: original code did NOT advance t for blanking/setup
+            # (small pre-existing timing bug, ~220 µs per direction change).
+            # Preserved here to avoid behavior change beyond the phase fix.
             current_dir = logical_dir
 
         period_us = max(MIN_PERIOD_US, int(round(1e6 / sps)))
@@ -502,7 +576,9 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
 
         phys_dir   = current_dir ^ int(dir_invert)
         net_steps += 1 if phys_dir else -1
-        t         += period_us / 1e6
+        dt         = period_us / 1e6
+        advance_phases(dt)
+        t         += dt
 
     return pulses, current_dir, t_end, net_steps
 
@@ -511,36 +587,184 @@ def wave_dur_s(pulses) -> float:
     return sum(p.delay for p in pulses) / 1e6
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FFT Frequency Tracker  —  parallel, robust to LMS instability
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FFTFreqTracker(threading.Thread):
+    """
+    Parallel FFT-based frequency tracker.  Bypasses the gradient tracker's
+    chicken-and-egg deadlock (gradient ω update depends on stable C, S, but
+    C, S can't stabilize until ω is locked).
+
+    Sole writer of `freqs_shared` while running.  The LMS thread auto-disables
+    its own gradient ω update when this thread is active, preserving a
+    single-writer invariant without locks on the freq state itself
+    (single-float writes are atomic under the GIL).
+
+    DESIGN NOTES
+    ────────────
+    • Window length controls bin resolution: Δf_bin = 1 / window_sec.
+      Parabolic interpolation around the peak typically reaches ~Δf_bin/20
+      for a clean single tone.
+
+    • Update interval should be ≥ window_sec/2.  Faster updates produce
+      correlated estimates (consecutive windows share most of their data)
+      without adding information.
+
+    • Per-update step is clamped to ±max_step_hz.  Originally introduced
+      to limit phase jumps caused by the absolute-time phase bug in
+      compute_chunk; that bug is now fixed (phase accumulator), so this
+      clamp's main remaining purpose is robustness against transient FFT
+      mis-locks (e.g., a noise spike briefly outranking the true peak).
+      A value of 0.05–0.10 Hz is reasonable for typical drift rates.
+
+    • Search band is [f_init - band_pad, f_init + band_pad] PER TONE.
+      Prevents the tracker from latching onto a resonance peak or harmonic
+      that's stronger than the disturbance fundamental.  band_pad should
+      bound the worst-case drift you observed in motor_drift_char.py.
+    """
+
+    def __init__(self, imu_buffer, buffer_lock, freqs_shared, freqs_lock,
+                 fs, window_sec, update_sec, max_step_hz, band_pad_hz,
+                 init_freqs, running):
+        super().__init__(daemon=True, name="fft-tracker")
+        self.imu_buffer  = imu_buffer
+        self.buffer_lock = buffer_lock
+        self.freqs_shared = freqs_shared      # list[float], one per tone
+        self.freqs_lock  = freqs_lock         # protects multi-element reads
+        self.fs          = fs
+        self.N           = int(window_sec * fs)
+        self.update_sec  = update_sec
+        self.max_step    = max_step_hz
+        self.band_pad    = band_pad_hz
+        self.init_freqs  = list(init_freqs)
+        self.running     = running
+        self.hann        = np.hanning(self.N)
+
+        # Diagnostics — read by status thread for printing
+        self.last_update_t  = 0.0
+        self.last_f_meas    = list(init_freqs)   # raw FFT result (pre-clamp)
+        self.update_count   = 0
+        self.skip_count     = 0   # times we skipped (buffer not full enough)
+
+    def _peak_in_band(self, spectrum, freqs_bin, f_lo, f_hi):
+        """Find dominant peak in [f_lo, f_hi] with parabolic interpolation."""
+        mask = (freqs_bin >= f_lo) & (freqs_bin <= f_hi)
+        band_idx = np.where(mask)[0]
+        if band_idx.size == 0:
+            return None
+        k_local = int(np.argmax(spectrum[band_idx]))
+        k = band_idx[k_local]
+        if 0 < k < len(spectrum) - 1:
+            y0, y1, y2 = spectrum[k-1], spectrum[k], spectrum[k+1]
+            denom = (y0 - 2.0 * y1 + y2)
+            delta = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
+            # Guard against runaway interpolation for non-parabolic peaks
+            if abs(delta) > 1.0:
+                delta = 0.0
+        else:
+            delta = 0.0
+        return (k + delta) * self.fs / self.N
+
+    def run(self):
+        # Wait for buffer to fill before the first FFT
+        while self.running[0]:
+            with self.buffer_lock:
+                ready = len(self.imu_buffer) >= self.N
+            if ready:
+                break
+            time.sleep(0.1)
+
+        freqs_bin = np.fft.rfftfreq(self.N, 1.0 / self.fs)
+        next_t    = time.monotonic()
+
+        while self.running[0]:
+            now = time.monotonic()
+            if now < next_t:
+                time.sleep(min(0.05, next_t - now))
+                continue
+            next_t += self.update_sec
+
+            # Snapshot the most recent N samples
+            with self.buffer_lock:
+                if len(self.imu_buffer) < self.N:
+                    self.skip_count += 1
+                    continue
+                samples = np.fromiter(self.imu_buffer, dtype=np.float64,
+                                      count=len(self.imu_buffer))[-self.N:]
+
+            samples = samples - samples.mean()
+            spec    = np.abs(np.fft.rfft(samples * self.hann))
+
+            # Per-tone search in a tight band around init freq
+            new_freqs = []
+            for i, f_init in enumerate(self.init_freqs):
+                f_lo = max(0.5, f_init - self.band_pad)
+                f_hi = f_init + self.band_pad
+                f_peak = self._peak_in_band(spec, freqs_bin, f_lo, f_hi)
+                if f_peak is None:
+                    new_freqs.append(self.freqs_shared[i])  # keep current
+                    continue
+                self.last_f_meas[i] = float(f_peak)
+                # Clamp per-update step
+                with self.freqs_lock:
+                    f_cur = self.freqs_shared[i]
+                step = f_peak - f_cur
+                if step > self.max_step:
+                    step = self.max_step
+                elif step < -self.max_step:
+                    step = -self.max_step
+                new_freqs.append(f_cur + step)
+
+            # Single bulk write under lock (multi-element atomicity)
+            with self.freqs_lock:
+                for i, f_new in enumerate(new_freqs):
+                    self.freqs_shared[i] = f_new
+
+            self.last_update_t = now
+            self.update_count += 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LMS thread  —  adapts C, S, and ω
 # ══════════════════════════════════════════════════════════════════════════════
 
 def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
-                  args, running, lms_stats, log_buf, per_tone_max_amp):
+                  args, running, lms_stats, log_buf, per_tone_max_amp,
+                  freqs_shared, freqs_lock, imu_buffer, buffer_lock,
+                  fft_tracker_active):
     """
-    Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if µ_omega > 0,
+    Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if the gradient
+    tracker is active (µ_omega > 0 AND fft_tracker_active is False),
     frequency (ω) for each tone.  Logs state to log_buf at --log_hz rate.
 
     per_tone_max_amp is a list of per-tone amplitude limits (mm), derived
-    from --max_amp_per_tone and the per-tone sps constraint.  Passed through
-    to clamp_coeffs so each tone is clamped independently.
+    from --max_amp_per_tone and the per-tone sps constraint.
 
     KEY DESIGN: Phase accumulator
     ─────────────────────────────
     φᵢ += ωᵢ · dt each sample replaces ωᵢ·t so that when ω changes
     the phase evolves continuously with no discontinuity.
 
-    Frequency gradient:
+    KEY DESIGN: Single-writer freq invariant
+    ────────────────────────────────────────
+    Frequency state lives in freqs_shared.  Exactly one thread writes it:
+      • If fft_tracker_active: the FFT thread is sole writer.
+        The gradient ω update here is skipped.
+      • Otherwise: this thread is sole writer (via the gradient update),
+        and freqs_shared is updated each iteration.
+    Either way, no write-write races on the freq state.
+
+    Frequency gradient (gradient mode only):
       ∂x/∂ω ≈ Sᵢ·cos(φᵢ) − Cᵢ·sin(φᵢ)   (quadrature signal)
-    Points in direction of increasing ω; subtracting µ_omega·e·quad
-    drives ω toward the disturbance frequency.
     """
     n        = len(freqs)
-    omegas   = [2.0 * math.pi * f for f in freqs]
     phis     = [0.0] * n
     period   = 1.0 / args.control_fs
     dt       = period
     mu       = args.mu
     mu_omega = args.mu_omega if args.mu_omega is not None else mu * 0.01
+    gradient_freq_active = (mu_omega > 0) and (not fft_tracker_active)
 
     log_every  = max(1, int(args.control_fs / args.log_hz))
     log_ticker = 0
@@ -552,6 +776,10 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
         if now < next_t:
             time.sleep(next_t - now)
             now = time.monotonic()
+
+        # ── Read the latest shared frequencies (FFT tracker may have updated) ─
+        with freqs_lock:
+            omegas = [2.0 * math.pi * f for f in freqs_shared]
 
         # ── Advance phase accumulators ────────────────────────────────────────
         for i in range(n):
@@ -568,6 +796,12 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
         else:
             e = hw_read_accel()
 
+        # ── Push to IMU ring buffer for the FFT tracker ──────────────────────
+        # deque.append is thread-safe under the GIL; the lock is only needed
+        # when we want a self-consistent snapshot of N elements (FFT thread).
+        with buffer_lock:
+            imu_buffer.append(e)
+
         # ── LMS gradient steps ────────────────────────────────────────────────
         with lms_lock:
             for i in range(n):
@@ -579,7 +813,7 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                 lms_coeffs[i][0] -= mu * e * cos_ref
                 lms_coeffs[i][1] -= mu * e * sin_ref
 
-                if mu_omega > 0:
+                if gradient_freq_active:
                     quad = S * cos_ref - C * sin_ref
                     omegas[i] -= mu_omega * e * quad
                     f_hz = omegas[i] / (2.0 * math.pi)
@@ -591,6 +825,12 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
 
             for i in range(n):
                 lms_freqs[i] = omegas[i] / (2.0 * math.pi)
+
+        # ── Write back freqs_shared if we (the LMS) are the sole writer ──────
+        if gradient_freq_active:
+            with freqs_lock:
+                for i in range(n):
+                    freqs_shared[i] = omegas[i] / (2.0 * math.pi)
 
         lms_stats['e']     = e
         lms_stats['t']     = now - t_start
@@ -723,6 +963,27 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     chunk_s     = args.chunk_ms / 1000.0
     log_buf     = {'t': [], 'e': [], 'C': [], 'S': [], 'f': []}
 
+    # ── Shared frequency state (single-writer invariant) ─────────────────────
+    # Writers:
+    #   • FFT tracker thread  if args.fft_tracker (sole writer)
+    #   • LMS thread          if not args.fft_tracker AND mu_omega > 0
+    # Reader: main loop at chunk boundary; LMS thread at each iteration
+    freqs_shared = list(F_init)
+    freqs_lock   = threading.Lock()
+
+    # ── IMU ring buffer for the FFT tracker ──────────────────────────────────
+    # Sized for fft_window_sec at control_fs, plus a small margin for jitter.
+    imu_buf_len  = int(args.fft_window_sec * args.control_fs * 1.5) + 100
+    imu_buffer   = deque(maxlen=imu_buf_len)
+    buffer_lock  = threading.Lock()
+
+    print(f"  FFT tracker: {'ON' if args.fft_tracker else 'OFF'}")
+    if args.fft_tracker:
+        print(f"    window={args.fft_window_sec}s  update={args.fft_update_sec}s  "
+              f"max_step={args.fft_max_step_hz}Hz  band_pad=±{args.fft_band_pad_hz}Hz")
+        if mu_omega > 0:
+            print(f"    Note: gradient ω update auto-disabled (FFT is sole writer)")
+
     # ── GPIO setup ────────────────────────────────────────────────────────────
     pi.set_mode(args.dir,   pigpio.OUTPUT)
     pi.set_mode(args.step,  pigpio.OUTPUT)
@@ -740,11 +1001,30 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
         target=lms_thread_fn,
         args=(F_init, lms_coeffs, lms_freqs, lms_lock,
               t_wall_start, args, running, lms_stats, log_buf,
-              per_tone_max_amp),
+              per_tone_max_amp,
+              freqs_shared, freqs_lock, imu_buffer, buffer_lock,
+              args.fft_tracker),
         daemon=True,
         name="lms-imu",
     )
     lms_t.start()
+
+    fft_t = None
+    if args.fft_tracker:
+        fft_t = FFTFreqTracker(
+            imu_buffer    = imu_buffer,
+            buffer_lock   = buffer_lock,
+            freqs_shared  = freqs_shared,
+            freqs_lock    = freqs_lock,
+            fs            = args.control_fs,
+            window_sec    = args.fft_window_sec,
+            update_sec    = args.fft_update_sec,
+            max_step_hz   = args.fft_max_step_hz,
+            band_pad_hz   = args.fft_band_pad_hz,
+            init_freqs    = F_init,
+            running       = running,
+        )
+        fft_t.start()
 
     stat_t = threading.Thread(
         target=status_thread_fn,
@@ -759,6 +1039,10 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     s_est      = 0.0
     last_dir   = 1
     t_end_wall = (t_wall_start + args.cancel_dur) if args.cancel_dur > 0 else None
+
+    # Per-tone stepper phase accumulators — see compute_chunk docstring.
+    # Mutated in place by compute_chunk; persists across all chunk calls.
+    step_phis  = [0.0] * n
 
     est_peak_sps = sum(
         math.sqrt(cs[0]**2 + cs[1]**2) * 2*math.pi*f * k
@@ -775,13 +1059,15 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     # ── Compute and fire first chunk ──────────────────────────────────────────
     with lms_lock:
         A, PHI = coeffs_to_aphi(lms_coeffs)
-        F_cur  = list(lms_freqs)
+    with freqs_lock:
+        F_cur = list(freqs_shared)
 
     pulses_c, last_dir, t_phase, steps_c = compute_chunk(
         t_phase, chunk_s, A, F_cur, PHI, k,
         args.max_sps, args.deadband_sps,
         args.step, args.dir, last_dir, args.dir_invert,
         args.dir_blanking_us, args.dir_setup_us,
+        step_phis,
     )
     dur_c = wave_dur_s(pulses_c) or chunk_s
 
@@ -803,13 +1089,15 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
 
             with lms_lock:
                 A, PHI = coeffs_to_aphi(lms_coeffs)
-                F_cur  = list(lms_freqs)
+            with freqs_lock:
+                F_cur  = list(freqs_shared)
 
             pulses_n, dir_n, t_next, steps_n = compute_chunk(
                 t_phase, chunk_s, A, F_cur, PHI, k,
                 args.max_sps, args.deadband_sps,
                 args.step, args.dir, last_dir, args.dir_invert,
                 args.dir_blanking_us, args.dir_setup_us,
+                step_phis,
             )
             dur_n = wave_dur_s(pulses_n) or chunk_s
 
@@ -856,6 +1144,8 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
         running[0] = False
         lms_t.join(timeout=0.5)
         stat_t.join(timeout=1.0)
+        if fft_t is not None:
+            fft_t.join(timeout=1.0)
         try:
             pi.wave_tx_stop()
             pi.wave_clear()
