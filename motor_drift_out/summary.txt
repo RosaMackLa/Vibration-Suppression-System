@@ -10,11 +10,11 @@ Dropped samples  : 0
 
 Statistics
 ----------
-  Mean frequency : 6.4033 Hz
-  Std dev (σ)    : 0.0082 Hz
-  Peak-to-peak   : 0.0245 Hz
-  Linear drift   : +0.182 mHz/s (+0.022 Hz over full run)
+  Mean frequency : 8.0623 Hz
+  Std dev (σ)    : 0.0170 Hz
+  Peak-to-peak   : 0.0600 Hz
+  Linear drift   : +0.035 mHz/s (+0.004 Hz over full run)
 
 Recommendation
 --------------
-ROCK-SOLID. Use --manual_freqs 6.403 in vss_controller.py. Gradient tracker alone is sufficient.
+ROCK-SOLID. Use --manual_freqs 8.062 in vss_controller.py. Gradient tracker alone is sufficient.
