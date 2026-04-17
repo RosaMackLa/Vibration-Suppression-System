@@ -95,7 +95,7 @@ Y_DIR  = 20
 Y_ENA  = 21
 
 # Shared backstop button (all physical endstops OR'd to one pin)
-BUTTON_PIN = 17   # BCM 17, externally conditioned; active LOW (0 = any button pressed)
+BUTTON_PIN = 17   # BCM 17, externally conditioned; active HIGH (1 = any button pressed)
 
 # Mechanical constants (shared between axes — same belt/pulley spec)
 DEFAULT_PULLEY_D_MM    = 11.70
@@ -120,7 +120,7 @@ def k_steps_per_mm(pulley_d_mm=DEFAULT_PULLEY_D_MM,
 
 # ──────────────────────────── Auto-centering ────────────────────────────────
 
-def _btn(pi, active_low=True):
+def _btn(pi, active_low=False):
     """Return True if any backstop button is currently pressed."""
     return (pi.read(BUTTON_PIN) == 0) if active_low else (pi.read(BUTTON_PIN) == 1)
 
@@ -261,7 +261,7 @@ def autocenter(pi, args, k):
     print("  Move carriages clear of walls before starting if needed.")
     print()
 
-    active_low = not args.button_active_high
+    active_low = args.button_active_low
 
     autocenter_axis(
         pi, X_STEP, X_DIR, "X",
@@ -484,8 +484,8 @@ def parse_args():
                    help="Logical direction to approach wall on X  (+1 or -1, default +1)")
     p.add_argument("--approach_dir_y",     type=int,   default=1, choices=[1, -1],
                    help="Logical direction to approach wall on Y  (+1 or -1, default +1)")
-    p.add_argument("--button_active_high", action="store_true",
-                   help="Button pin is active HIGH (default: active LOW)")
+    p.add_argument("--button_active_low", action="store_true",
+                   help="Button pin is active LOW (default: active HIGH)")
 
     return p.parse_args()
 
