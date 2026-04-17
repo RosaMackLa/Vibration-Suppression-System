@@ -478,12 +478,12 @@ def parse_args():
                    help="Step rate during wall approach [sps]  (default 600 — slow & gentle)")
     p.add_argument("--return_sps",         type=float, default=4000.0,
                    help="Max step rate during back-off to centre [sps]  (default 4000)")
-    p.add_argument("--center_mm",          type=float, default=HALF_TRAVEL_MM,
-                   help="Distance to back off after wall touch [mm]  (default = HALF_TRAVEL_MM)")
-    p.add_argument("--approach_dir_x",     type=int,   default=1, choices=[1, -1],
-                   help="Logical direction to approach wall on X  (+1 or -1, default +1)")
-    p.add_argument("--approach_dir_y",     type=int,   default=1, choices=[1, -1],
-                   help="Logical direction to approach wall on Y  (+1 or -1, default +1)")
+    p.add_argument("--center_mm",          type=float, default=50.0,
+                   help="Distance to back off after wall touch [mm]  (default 50)")
+    p.add_argument("--approach_dir_x",     type=int,   default=-1, choices=[1, -1],
+                   help="Logical direction to approach wall on X  (+1 or -1, default -1)")
+    p.add_argument("--approach_dir_y",     type=int,   default=-1, choices=[1, -1],
+                   help="Logical direction to approach wall on Y  (+1 or -1, default -1)")
     p.add_argument("--button_active_low", action="store_true",
                    help="Button pin is active LOW (default: active HIGH)")
 
