@@ -94,6 +94,9 @@ Y_STEP = 19
 Y_DIR  = 20
 Y_ENA  = 21
 
+# Shared backstop button (all physical endstops OR'd to one pin)
+BUTTON_PIN = 17   # BCM 17, externally conditioned; active LOW (0 = any button pressed)
+
 # Mechanical constants (shared between axes — same belt/pulley spec)
 DEFAULT_PULLEY_D_MM    = 11.70
 DEFAULT_PULSES_PER_REV = 3200
@@ -113,6 +116,178 @@ def k_steps_per_mm(pulley_d_mm=DEFAULT_PULLEY_D_MM,
                    pulses_per_rev=DEFAULT_PULSES_PER_REV):
     circumference = math.pi * pulley_d_mm
     return pulses_per_rev / circumference
+
+
+# ──────────────────────────── Auto-centering ────────────────────────────────
+
+def _btn(pi, active_low=True):
+    """Return True if any backstop button is currently pressed."""
+    return (pi.read(BUTTON_PIN) == 0) if active_low else (pi.read(BUTTON_PIN) == 1)
+
+
+def _step_once(pi, step_pin, dir_pin, direction, dir_invert,
+               last_actual_dir, period_us):
+    """
+    Output one step pulse and observe the step period.
+
+    direction      : +1 or -1 in logical (pre-invert) space
+    last_actual_dir: the last DIR-pin state (+1 or -1 in hardware space)
+    Returns new last_actual_dir.
+    """
+    actual_dir = direction * (-1 if dir_invert else 1)
+    if actual_dir != last_actual_dir:
+        pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+        time.sleep(DIR_SETUP_US * 1e-6)
+    pi.write(step_pin, 1)
+    time.sleep(STEP_WIDTH_US * 1e-6)
+    pi.write(step_pin, 0)
+    remainder = period_us - STEP_WIDTH_US
+    if remainder > 0:
+        time.sleep(remainder * 1e-6)
+    return actual_dir
+
+
+def _period_us(step_idx, total_steps, max_sps, min_sps=800, ramp_frac=0.20):
+    """
+    Trapezoidal velocity profile — ramp up for the first ramp_frac of
+    steps, cruise, then ramp back down.  Prevents stall on cold start.
+    """
+    ramp = max(1, int(total_steps * ramp_frac))
+    if step_idx < ramp:
+        sps = min_sps + (max_sps - min_sps) * (step_idx / ramp)
+    elif step_idx > total_steps - ramp:
+        sps = min_sps + (max_sps - min_sps) * ((total_steps - step_idx) / ramp)
+    else:
+        sps = max_sps
+    return int(1e6 / max(sps, 1.0))
+
+
+def autocenter_axis(pi, step_pin, dir_pin, axis_name,
+                    k, dir_invert, approach_dir,
+                    approach_sps, return_sps,
+                    center_mm, active_low=True):
+    """
+    Find one axis wall then back off to centre.
+
+    Algorithm
+    ─────────
+    1. If button already pressed → skip approach, go straight to back-off.
+    2. Otherwise step slowly in `approach_dir` (+1 or -1) until button fires
+       OR the safety step limit is reached.
+    3. Pause briefly, then drive in the opposite direction by `center_mm`
+       using a trapezoidal velocity profile.
+
+    Parameters
+    ──────────
+    approach_dir : +1 → move carriage toward the positive-direction wall first
+                   -1 → move toward the negative-direction wall first
+    center_mm    : distance to back off after touching the wall.
+                   Set this to the distance from the wall to mechanical centre
+                   (typically HALF_TRAVEL_MM).
+    """
+    MAX_APPROACH_STEPS = int((HALF_TRAVEL_MM + 15.0) * k)   # hard safety limit
+    approach_period_us = int(1e6 / max(approach_sps, 1.0))
+    return_steps       = int(center_mm * k)
+
+    print(f"\n  [{axis_name}] ── Centering ──────────────────────────────")
+
+    # ── Phase 1: approach wall ──────────────────────────────────────────────
+    if _btn(pi, active_low):
+        print(f"  [{axis_name}] Button already pressed — skipping approach.")
+        steps_taken = 0
+    else:
+        print(f"  [{axis_name}] Approaching wall at {approach_sps} sps "
+              f"(dir={'+ ' if approach_dir > 0 else '- '}logical)...")
+        last_dir   = 0   # unknown at start; _step_once handles DIR setup
+        steps_taken = 0
+
+        # Set DIR before loop to avoid first-step direction jitter
+        actual_dir = approach_dir * (-1 if dir_invert else 1)
+        pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+        time.sleep(DIR_SETUP_US * 1e-6)
+        last_dir = actual_dir
+
+        for _ in range(MAX_APPROACH_STEPS):
+            if _btn(pi, active_low):
+                break
+            last_dir = _step_once(pi, step_pin, dir_pin,
+                                   approach_dir, dir_invert,
+                                   last_dir, approach_period_us)
+            steps_taken += 1
+        else:
+            print(f"  [{axis_name}] WARNING: hit step limit ({MAX_APPROACH_STEPS/k:.0f} mm) "
+                  "without triggering button.  Check button wiring / active level.")
+            return
+
+        print(f"  [{axis_name}] Button triggered after {steps_taken} steps "
+              f"({steps_taken/k:.1f} mm travel).")
+
+    # Brief pause so the carriage is fully at rest before reversing
+    time.sleep(0.25)
+
+    # ── Phase 2: back off to centre ─────────────────────────────────────────
+    return_dir = -approach_dir
+    print(f"  [{axis_name}] Backing off {center_mm:.1f} mm "
+          f"({return_steps} steps) at up to {return_sps} sps...")
+
+    actual_dir = return_dir * (-1 if dir_invert else 1)
+    pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+    time.sleep(DIR_SETUP_US * 1e-6)
+    last_dir = actual_dir
+
+    for i in range(return_steps):
+        # Safety check: shouldn't hit a button during return, but stop if so
+        if _btn(pi, active_low) and i > 200:
+            print(f"  [{axis_name}] Button during return at step {i} — stopping.")
+            break
+        period = _period_us(i, return_steps, return_sps)
+        last_dir = _step_once(pi, step_pin, dir_pin,
+                               return_dir, dir_invert,
+                               last_dir, period)
+
+    print(f"  [{axis_name}] Centred ✓")
+
+
+def autocenter(pi, args, k):
+    """
+    Centre X axis, then Y axis.
+    Both drivers stay enabled (holding current) throughout so neither
+    axis drifts while the other is being centred.
+    """
+    print("\n" + "═" * 56)
+    print("  AUTO-CENTERING")
+    print("═" * 56)
+    print("  Drivers enabled on both axes to prevent drift.")
+    print("  Move carriages clear of walls before starting if needed.")
+    print()
+
+    active_low = not args.button_active_high
+
+    autocenter_axis(
+        pi, X_STEP, X_DIR, "X",
+        k, args.dir_invert_x,
+        approach_dir  = args.approach_dir_x,
+        approach_sps  = args.approach_sps,
+        return_sps    = args.return_sps,
+        center_mm     = args.center_mm,
+        active_low    = active_low,
+    )
+
+    # Small pause between axes so vibrations from X settle
+    time.sleep(0.5)
+
+    autocenter_axis(
+        pi, Y_STEP, Y_DIR, "Y",
+        k, args.dir_invert_y,
+        approach_dir  = args.approach_dir_y,
+        approach_sps  = args.approach_sps,
+        return_sps    = args.return_sps,
+        center_mm     = args.center_mm,
+        active_low    = active_low,
+    )
+
+    print("\n  Both axes centred.  Starting pattern in 1 s...")
+    time.sleep(1.0)
 
 
 # ──────────────────────── Single-axis pulse generation ──────────────────────
@@ -296,6 +471,22 @@ def parse_args():
     p.add_argument("--dir_invert_y",   action="store_true",
                    help="Invert Y direction")
 
+    # Auto-centering
+    p.add_argument("--autocenter",         action="store_true",
+                   help="Run auto-centering routine before starting pattern")
+    p.add_argument("--approach_sps",       type=float, default=600.0,
+                   help="Step rate during wall approach [sps]  (default 600 — slow & gentle)")
+    p.add_argument("--return_sps",         type=float, default=4000.0,
+                   help="Max step rate during back-off to centre [sps]  (default 4000)")
+    p.add_argument("--center_mm",          type=float, default=HALF_TRAVEL_MM,
+                   help="Distance to back off after wall touch [mm]  (default = HALF_TRAVEL_MM)")
+    p.add_argument("--approach_dir_x",     type=int,   default=1, choices=[1, -1],
+                   help="Logical direction to approach wall on X  (+1 or -1, default +1)")
+    p.add_argument("--approach_dir_y",     type=int,   default=1, choices=[1, -1],
+                   help="Logical direction to approach wall on Y  (+1 or -1, default +1)")
+    p.add_argument("--button_active_high", action="store_true",
+                   help="Button pin is active HIGH (default: active LOW)")
+
     return p.parse_args()
 
 
@@ -369,6 +560,15 @@ def main():
     # Enable both drivers (active low on most drivers; adjust if needed)
     pi.write(X_ENA, 1)
     pi.write(Y_ENA, 1)
+
+    # Set up button pin as input with pull-up
+    pi.set_mode(BUTTON_PIN, pigpio.INPUT)
+    pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
+
+    # ── Auto-centering ────────────────────────────────────────────────────────
+    if args.autocenter:
+        autocenter(pi, args, k)
+
     pi.wave_clear()
 
     # State for each axis
