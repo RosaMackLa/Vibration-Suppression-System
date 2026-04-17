@@ -185,7 +185,7 @@ def autocenter_axis(pi, step_pin, dir_pin, axis_name,
                    Set this to the distance from the wall to mechanical centre
                    (typically HALF_TRAVEL_MM).
     """
-    MAX_APPROACH_STEPS = int((HALF_TRAVEL_MM + 15.0) * k)   # hard safety limit
+    MAX_APPROACH_STEPS = int((2*HALF_TRAVEL_MM + 15.0) * k)   # hard safety limit
     approach_period_us = int(1e6 / max(approach_sps, 1.0))
     return_steps       = int(center_mm * k)
 
@@ -475,7 +475,7 @@ def parse_args():
     p.add_argument("--autocenter",         action="store_true",
                    help="Run auto-centering routine before starting pattern")
     p.add_argument("--approach_sps",       type=float, default=1000.0,
-                   help="Step rate during wall approach [sps]  (default 600 — slow & gentle)")
+                   help="Step rate during wall approach [sps]  (default 1000 — slow & gentle)")
     p.add_argument("--return_sps",         type=float, default=4000.0,
                    help="Max step rate during back-off to centre [sps]  (default 4000)")
     p.add_argument("--center_mm",          type=float, default=45.0,
