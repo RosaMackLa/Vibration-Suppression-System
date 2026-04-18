@@ -1,20 +1,20 @@
 Motor Frequency Drift Characterization
 ======================================
 
-Duration         : 120.0 s
+Duration         : 300.0 s
 Sample rate      : target 800 Hz, actual 800.00 Hz
 Window size      : 10.0 s
-Windows analyzed : 12
+Windows analyzed : 30
 Search band      : [5.0, 15.0] Hz
 Dropped samples  : 0
 
 Statistics
 ----------
-  Mean frequency : 8.0623 Hz
-  Std dev (σ)    : 0.0170 Hz
-  Peak-to-peak   : 0.0600 Hz
-  Linear drift   : +0.035 mHz/s (+0.004 Hz over full run)
+  Mean frequency : 8.4390 Hz
+  Std dev (σ)    : 0.0200 Hz
+  Peak-to-peak   : 0.0805 Hz
+  Linear drift   : -0.047 mHz/s (-0.014 Hz over full run)
 
 Recommendation
 --------------
-ROCK-SOLID. Use --manual_freqs 8.062 in vss_controller.py. Gradient tracker alone is sufficient.
+ROCK-SOLID. Use --manual_freqs 8.439 in vss_controller.py. Gradient tracker alone is sufficient.
