@@ -91,6 +91,7 @@ USAGE
 """
 
 import argparse
+import csv
 import math
 import time
 import threading
@@ -265,6 +266,10 @@ def parse_args():
                      help="Skip plot generation after cancellation.")
     log.add_argument("--plot_out", type=str,   default="vss_run_plot.png",
                      help="Output filename for the convergence plot.")
+    log.add_argument("--csv_out",  type=str,   default="",
+                     help="If set, write run data to this CSV file after cancellation. "
+                          "Columns: t_s, e_m_s2, C_mm, S_mm, f_hz, A_mm  (tone 1). "
+                          "Metadata written as # comment lines at the top.")
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     p.add_argument("--status_hz",        type=float, default=2.0)
@@ -406,6 +411,74 @@ def coeffs_to_aphi(coeffs: list):
     A   = [math.sqrt(cs[0] ** 2 + cs[1] ** 2) for cs in coeffs]
     PHI = [math.atan2(cs[0], cs[1])            for cs in coeffs]
     return A, PHI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CSV export
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _write_run_csv(log_buf, args, F_init):
+    """
+    Write run log to CSV for post-processing in MATLAB or Python.
+
+    Columns (tone 1 only — extend if multi-tone logging is added):
+      t_s      — time since cancellation start [s]
+      e_m_s2   — raw IMU error sample at log time [m/s²]
+      C_mm     — LMS cosine coefficient [mm]
+      S_mm     — LMS sine coefficient [mm]
+      f_hz     — tracked frequency [Hz]
+      A_mm     — actuator amplitude sqrt(C²+S²) [mm]
+
+    Metadata is written as # comment lines so MATLAB readtable()
+    can skip them with:  readtable(f, 'CommentStyle', '#')
+    """
+    import datetime
+
+    path    = args.csv_out
+    t_arr   = log_buf['t']
+    e_arr   = log_buf['e']
+    C_arr   = log_buf['C']
+    S_arr   = log_buf['S']
+    f_arr   = log_buf['f']
+    n       = len(t_arr)
+
+    if n < 2:
+        print("  CSV: not enough data to write.")
+        return
+
+    mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
+
+    with open(path, 'w', newline='') as fh:
+        # ── Metadata header ───────────────────────────────────────────────────
+        fh.write(f"# VSS hardware run — {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+        fh.write(f"# mu={args.mu}  mu_omega={mu_omega}  "
+                 f"control_fs={args.control_fs}  log_hz={args.log_hz}\n")
+        fh.write(f"# cancel_dur={args.cancel_dur}s  "
+                 f"actual_dur={t_arr[-1]:.2f}s  n_samples={n}\n")
+        fh.write(f"# F_init_hz={F_init}  "
+                 f"max_amp_per_tone={args.max_amp_per_tone}mm  "
+                 f"max_total_amp={args.max_total_amp}mm\n")
+        fh.write(f"# dir_invert={args.dir_invert}  simulate={args.simulate}\n")
+        fh.write(f"# NOTE: C_mm, S_mm, f_hz, A_mm are tone 1 only\n")
+
+        # ── Data ──────────────────────────────────────────────────────────────
+        writer = csv.writer(fh)
+        writer.writerow(['t_s', 'e_m_s2', 'C_mm', 'S_mm', 'f_hz', 'A_mm'])
+        for i in range(n):
+            C = C_arr[i]
+            S = S_arr[i]
+            A = math.sqrt(C * C + S * S)
+            writer.writerow([
+                f"{t_arr[i]:.6f}",
+                f"{e_arr[i]:.6f}",
+                f"{C:.6f}",
+                f"{S:.6f}",
+                f"{f_arr[i]:.6f}",
+                f"{A:.6f}",
+            ])
+
+    print(f"  CSV saved:  {path}  ({n} rows,  "
+          f"~{t_arr[-1]:.1f}s @ {args.log_hz:.0f}Hz)")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Convergence plot
@@ -1176,6 +1249,9 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
             print("\nGenerating convergence plot...")
             plot_run(log_buf['t'], log_buf['e'], log_buf['C'],
                      log_buf['S'], log_buf['f'], args)
+
+        if args.csv_out:
+            _write_run_csv(log_buf, args, F_init)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
