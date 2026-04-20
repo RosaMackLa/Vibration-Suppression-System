@@ -52,10 +52,11 @@ def read_accel_sample_simulated(t: float) -> float:
     return a + b + n
 
 
-def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tuple[np.ndarray, float]:
+def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Collect N = duration*fs samples at ~fs rate.
-    Returns samples array and measured sampling rate (based on timestamps).
+    Returns (samples, timestamps, measured_fs).
+    Timestamps are seconds elapsed from t0.
     """
     if duration_s <= 0:
         raise ValueError("duration must be > 0")
@@ -66,13 +67,12 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
     if n_target < 8:
         raise ValueError("duration*fs too small; need at least ~8 samples")
 
-    samples = np.zeros(n_target, dtype=float)
+    samples  = np.zeros(n_target, dtype=float)
     t_stamps = np.zeros(n_target, dtype=float)
 
     period = 1.0 / fs_hz
-    t0 = time.perf_counter()
+    t0     = time.perf_counter()
     next_t = t0
-
 
     for i in range(n_target):
         now = time.perf_counter()
@@ -90,19 +90,19 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
             val = read_accel_sample()
         t_after_read = time.perf_counter()
 
-        samples[i] = val
+        samples[i]  = val
+        t_stamps[i] = t          # elapsed seconds from t0
 
         if i % 100 == 0:
             read_dt_ms = (t_after_read - t_before_read) * 1000
             print(f"i={i}  t={t:.3f}s  read_dt={read_dt_ms:.2f} ms")
 
-        t_stamps[i] = now
         next_t += period
 
     # estimate actual fs from timestamps
-    dt = np.diff(t_stamps)
+    dt     = np.diff(t_stamps)
     fs_meas = 1.0 / np.mean(dt) if len(dt) > 0 else fs_hz
-    return samples, fs_meas
+    return samples, t_stamps, fs_meas
 
 
 def single_sided_fft_amplitude(x: np.ndarray, fs_hz: float, window: str = "hann") -> Tuple[np.ndarray, np.ndarray]:
@@ -126,14 +126,14 @@ def single_sided_fft_amplitude(x: np.ndarray, fs_hz: float, window: str = "hann"
     xw = x * w
 
     # FFT (real)
-    X = np.fft.rfft(xw)
+    X    = np.fft.rfft(xw)
     freqs = np.fft.rfftfreq(n, d=1.0 / fs_hz)
 
     # Amplitude scaling:
     # - rfft gives N/2+1 bins
     # - For single-sided spectrum, multiply non-DC, non-Nyquist bins by 2
     # - Also correct for window coherent gain (mean of window)
-    cg = np.mean(w)  # coherent gain
+    cg   = np.mean(w)  # coherent gain
     amps = (np.abs(X) / (n * cg))
 
     if n > 1:
@@ -180,7 +180,7 @@ def pick_top_peaks(
     # sort candidates by amplitude descending
     candidates.sort(key=lambda i: amps[i], reverse=True)
 
-    chosen = []
+    chosen     = []
     suppressed = np.zeros(len(amps), dtype=bool)
 
     for i in candidates:
@@ -194,7 +194,7 @@ def pick_top_peaks(
             break
 
     peak_amps = [amps[i] for i in chosen]
-    max_amp = max(peak_amps) if peak_amps else 1.0
+    max_amp   = max(peak_amps) if peak_amps else 1.0
 
     peaks = [
         Peak(freq_hz=float(freqs[i]), amp=float(amps[i]), rel_amp=float(amps[i] / max_amp))
@@ -205,6 +205,7 @@ def pick_top_peaks(
 
 def plot_results(
     samples: np.ndarray,
+    t_stamps: np.ndarray,
     fs_meas: float,
     freqs: np.ndarray,
     amps: np.ndarray,
@@ -224,14 +225,12 @@ def plot_results(
     matplotlib.use("Agg")           # must be set before importing pyplot
     import matplotlib.pyplot as plt
 
-    t_axis = np.arange(len(samples)) / fs_meas   # time vector in seconds
-
     fig, axes = plt.subplots(2, 1, figsize=(10, 7))
     fig.suptitle("VSS — Accelerometer Capture & FFT", fontweight="bold")
 
     # ── Panel 1: time series ──────────────────────────────────────────────────
     ax_t = axes[0]
-    ax_t.plot(t_axis, samples, linewidth=0.6, color="steelblue")
+    ax_t.plot(t_stamps, samples, linewidth=0.6, color="steelblue")
     ax_t.set_xlabel("Time (s)")
     ax_t.set_ylabel("Acceleration (m/s²)")
     ax_t.set_title("Raw Acceleration Time Series")
@@ -240,9 +239,8 @@ def plot_results(
     # ── Panel 2: FFT spectrum ─────────────────────────────────────────────────
     ax_f = axes[1]
 
-    # Optionally restrict the x-axis to the analysis band for clarity
-    freq_lo = min_freq_hz
-    freq_hi = max_freq_hz if max_freq_hz is not None else freqs[-1]
+    freq_lo   = min_freq_hz
+    freq_hi   = max_freq_hz if max_freq_hz is not None else freqs[-1]
     band_mask = (freqs >= freq_lo) & (freqs <= freq_hi)
 
     ax_f.plot(freqs[band_mask], amps[band_mask], linewidth=0.8, color="darkorange")
@@ -251,7 +249,6 @@ def plot_results(
     ax_f.set_title("Single-Sided FFT Amplitude Spectrum")
     ax_f.grid(True, linestyle="--", alpha=0.5)
 
-    # Mark detected peaks
     for p in peaks:
         ax_f.axvline(p.freq_hz, color="crimson", linewidth=0.8, linestyle="--", alpha=0.7)
         ax_f.annotate(
@@ -270,23 +267,47 @@ def plot_results(
     print(f"Plot saved to: {out_path}")
 
 
+def save_data_csv(t_stamps: np.ndarray, samples: np.ndarray, path: str) -> None:
+    """
+    Save raw time-series data as a two-column CSV:
+        time_s, accel_ms2
+
+    This is the primary export for post-processing in MATLAB or other tools.
+    The timestamp column contains elapsed seconds from t0 (not wall-clock time),
+    matching the values used for the Python plot.
+    """
+    data = np.column_stack([t_stamps, samples])
+    np.savetxt(
+        path,
+        data,
+        delimiter=",",
+        header="time_s,accel_ms2",
+        comments="",   # suppress the leading '#' numpy adds by default
+        fmt="%.9f",    # enough precision to recover fs accurately on reload
+    )
+    print(f"Raw data saved to:  {path}  ({len(samples)} samples)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Collect accel data, FFT, report top dominant frequencies.")
-    ap.add_argument("--duration", type=float, default=30.0, help="seconds to record (default 30)")
-    ap.add_argument("--fs", type=float, default=800.0, help="target sampling rate in Hz (default 800)")
-    ap.add_argument("--axis", type=str, default="scalar", help="placeholder; use if you later add x/y/z")
-    ap.add_argument("--min-freq", type=float, default=1.0, help="ignore peaks below this frequency (Hz)")
-    ap.add_argument("--max-freq", type=float, default=None, help="ignore peaks above this frequency (Hz)")
-    ap.add_argument("--window", type=str, default="hann", choices=["hann", "rect"], help="FFT window")
-    ap.add_argument("--simulate", action="store_true", help="use simulated accel instead of hardware")
-    ap.add_argument("--save-spectrum", type=str, default=None, help="path to save spectrum CSV (freq, amp)")
-    ap.add_argument("--plot", action="store_true", help="save a two-panel plot (time series + FFT spectrum)")
-    ap.add_argument("--plot-out", type=str, default="spectrum_plot.png",
+    ap.add_argument("--duration",      type=float, default=30.0,  help="seconds to record (default 30)")
+    ap.add_argument("--fs",            type=float, default=800.0, help="target sampling rate in Hz (default 800)")
+    ap.add_argument("--axis",          type=str,   default="scalar", help="placeholder; use if you later add x/y/z")
+    ap.add_argument("--min-freq",      type=float, default=1.0,   help="ignore peaks below this frequency (Hz)")
+    ap.add_argument("--max-freq",      type=float, default=None,  help="ignore peaks above this frequency (Hz)")
+    ap.add_argument("--window",        type=str,   default="hann", choices=["hann", "rect"], help="FFT window")
+    ap.add_argument("--simulate",      action="store_true",        help="use simulated accel instead of hardware")
+    ap.add_argument("--save-data",     type=str,   default=None,  help="path to save raw time-series CSV (time_s, accel_ms2)")
+    ap.add_argument("--save-spectrum", type=str,   default=None,  help="path to save spectrum CSV (freq_hz, amp)")
+    ap.add_argument("--plot",          action="store_true",        help="save a two-panel plot (time series + FFT spectrum)")
+    ap.add_argument("--plot-out",      type=str,   default="spectrum_plot.png",
                     help="output path for the plot image (default: spectrum_plot.png)")
     args = ap.parse_args()
 
-    x, fs_meas = collect_time_series(args.duration, args.fs, args.simulate)
+    # ── Collect ──────────────────────────────────────────────────────────────
+    x, t_stamps, fs_meas = collect_time_series(args.duration, args.fs, args.simulate)
 
+    # ── Spectral analysis ─────────────────────────────────────────────────────
     freqs, amps = single_sided_fft_amplitude(x, fs_meas, window=args.window)
 
     peaks = pick_top_peaks(
@@ -298,9 +319,10 @@ def main():
         guard_bins=2
     )
 
-    print(f"Requested duration: {args.duration:.3f} s")
-    print(f"Target fs: {args.fs:.2f} Hz | Measured fs: {fs_meas:.2f} Hz")
-    print(f"FFT bins: {len(freqs)} | Nyquist: {fs_meas/2:.2f} Hz")
+    # ── Console report ────────────────────────────────────────────────────────
+    print(f"\nRequested duration : {args.duration:.3f} s")
+    print(f"Target fs          : {args.fs:.2f} Hz | Measured fs: {fs_meas:.2f} Hz")
+    print(f"FFT bins           : {len(freqs)} | Nyquist: {fs_meas/2:.2f} Hz")
     print()
 
     if not peaks:
@@ -308,17 +330,22 @@ def main():
     else:
         print("Top dominant frequencies:")
         for j, p in enumerate(peaks, start=1):
-            print(f"{j}) {p.freq_hz:8.3f} Hz | amp={p.amp:.6g} | rel={p.rel_amp:.3f}")
+            print(f"  {j}) {p.freq_hz:8.3f} Hz | amp={p.amp:.6g} | rel={p.rel_amp:.3f}")
+
+    # ── Exports ───────────────────────────────────────────────────────────────
+    if args.save_data:
+        save_data_csv(t_stamps, x, args.save_data)
 
     if args.save_spectrum:
         data = np.column_stack([freqs, amps])
-        np.savetxt(args.save_spectrum, data, delimiter=",", header="freq_hz,amp", comments="")
-        print()
-        print(f"Saved spectrum CSV to: {args.save_spectrum}")
+        np.savetxt(args.save_spectrum, data, delimiter=",",
+                   header="freq_hz,amp", comments="", fmt="%.9f")
+        print(f"Spectrum CSV saved: {args.save_spectrum}")
 
     if args.plot:
         plot_results(
             samples=x,
+            t_stamps=t_stamps,
             fs_meas=fs_meas,
             freqs=freqs,
             amps=amps,
