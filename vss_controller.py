@@ -33,7 +33,9 @@ CONTROL LAW (per tone i, ωᵢ = 2πfᵢ)
 ARCHITECTURE
 ────────────
   Main thread   : DMA double-buffer loop — reads latest (C, S, ω) at every
-                  chunk boundary and passes adapted frequency to compute_chunk
+                  chunk boundary and passes adapted frequency to compute_chunk.
+                  Also polls BUTTON_PIN each chunk: if a backstop is hit during
+                  cancellation the loop exits cleanly.
   LMS thread    : ~control_fs Hz — IMU read → gradient update → clamp → log;
                   also pushes IMU samples into a ring buffer for the FFT thread
   FFT thread    : --fft_tracker only — every --fft_update_sec, computes a
@@ -68,15 +70,24 @@ AMPLITUDE CLAMPING
 AUTO-CENTERING  (Phase 0)
 ─────────────────────────
   On by default; disable with --no_autocenter.
-  Uses bit-bang GPIO to step the carriage at --approach_sps toward the
-  backstop button (BCM 17), then drives back --center_mm with a trapezoidal
-  velocity ramp.  Guarantees a known start position before the DMA engine
-  takes over.  Automatically skipped in --simulate mode.
+  Uses bit-bang GPIO to step the carriage at --approach_sps until
+  BUTTON_PIN fires, then drives back --center_mm with a trapezoidal
+  velocity ramp.  Both physical end-stops on the rail share BUTTON_PIN
+  (BCM 17): whichever wall is in the approach direction will trigger it.
+
+  No mid-back-off button check is needed — center_mm bounds the move and
+  autocenter is the travel safety for this phase.
 
   Algorithm:
     1. If button already pressed → skip approach, go straight to back-off.
-    2. Step slowly until button fires OR safety step limit hit.
+    2. Step at approach_sps until button fires OR safety step limit hit.
     3. Pause 250 ms, then back off --center_mm with trapezoidal ramp.
+
+CANCELLATION BUTTON SAFETY  (Phase 2)
+──────────────────────────────────────
+  BUTTON_PIN is polled once per chunk boundary (~50 ms) during Phase 2.
+  If the carriage drifts to a wall (e.g. LMS divergence), the loop exits
+  immediately with a diagnostic message before saving logs and the plot.
 
 LOGGING & PLOTTING
 ──────────────────
@@ -144,8 +155,10 @@ DEFAULT_DIR_BCM        = 16
 PULSE_HIGH_US          = 5
 ENABLE_PIN             = 25        # backstop interlock output (active HIGH = enabled)
 
-# Backstop button input pin
-BUTTON_PIN             = 17        # BCM 17 — active HIGH by default (1 = pressed)
+# Both physical end-stops on the rail share this single pin.
+# A button press means "carriage has reached a wall" — which wall depends on
+# which direction was commanded.
+BUTTON_PIN         = 17            # BCM 17 — active HIGH by default
 
 # Auto-centering bit-bang timing
 # These are separate from PULSE_HIGH_US which is for DMA waveform generation.
@@ -210,10 +223,9 @@ def k_steps_per_mm(pulley_d_mm: float, pulses_per_rev: float) -> float:
 # Auto-centering  (Phase 0)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ac_btn(pi, active_low=False):
+def _btn(pi, active_low=False) -> bool:
     """Return True if the backstop button is currently pressed."""
-    val = pi.read(BUTTON_PIN)
-    return (val == 0) if active_low else (val == 1)
+    return (pi.read(BUTTON_PIN) == 0) if active_low else (pi.read(BUTTON_PIN) == 1)
 
 
 def _ac_step_once(pi, step_pin, dir_pin, direction, dir_invert,
@@ -260,17 +272,18 @@ def autocenter_vss(pi, args, k):
     """
     Auto-center the VSS X-axis carriage (Phase 0).
 
-    Sets up STEP, DIR, ENABLE_PIN, and BUTTON_PIN, then:
-      1. Creeps toward the wall at approach_sps until button fires.
-      2. Pauses 250 ms.
-      3. Backs off center_mm with a trapezoidal velocity ramp.
+    Both physical end-stops share BUTTON_PIN (BCM 17).  The approach direction
+    determines which wall is hit; reversing center_mm gets us to centre.
+    No mid-back-off button check is needed — center_mm bounds the move.
 
-    This runs before any wave_add_generic call, so there is no conflict
-    with the pigpio DMA allocator.
+    Algorithm:
+      1. If button already pressed → skip approach, go straight to back-off.
+      2. Step at approach_sps until button fires OR safety step limit hit.
+      3. Pause 250 ms, then back off center_mm with trapezoidal velocity ramp.
     """
-    step_pin    = args.step
-    dir_pin     = args.dir
-    dir_invert  = args.dir_invert
+    step_pin     = args.step
+    dir_pin      = args.dir
+    dir_invert   = args.dir_invert
     approach_dir = args.approach_dir
     approach_sps = args.approach_sps
     return_sps   = args.return_sps
@@ -306,9 +319,10 @@ def autocenter_vss(pi, args, k):
     time.sleep(0.05)
 
     # ── Phase 1: approach wall ────────────────────────────────────────────────
-    if _ac_btn(pi, active_low):
+    if _btn(pi, active_low):
         print("  Button already pressed — skipping approach.")
         steps_taken = 0
+        last_dir = approach_dir * (-1 if dir_invert else 1)
     else:
         print(f"  Creeping toward wall at {approach_sps:.0f} sps "
               f"(dir={'+ ' if approach_dir > 0 else '- '}logical)...")
@@ -316,11 +330,11 @@ def autocenter_vss(pi, args, k):
         actual_dir = approach_dir * (-1 if dir_invert else 1)
         pi.write(dir_pin, 1 if actual_dir > 0 else 0)
         time.sleep(AC_DIR_SETUP_US * 1e-6)
-        last_dir   = actual_dir
+        last_dir    = actual_dir
         steps_taken = 0
 
         for _ in range(MAX_APPROACH_STEPS):
-            if _ac_btn(pi, active_low):
+            if _btn(pi, active_low):
                 break
             last_dir = _ac_step_once(pi, step_pin, dir_pin,
                                      approach_dir, dir_invert,
@@ -340,6 +354,9 @@ def autocenter_vss(pi, args, k):
     time.sleep(0.25)
 
     # ── Phase 2: back off to centre ────────────────────────────────────────────
+    # return_dir is opposite to approach_dir — moves toward centre.
+    # No button check during this move: center_mm bounds it and autocenter
+    # is the travel safety for Phase 0.
     return_dir = -approach_dir
     print(f"  Backing off {center_mm:.1f} mm "
           f"({return_steps} steps) at up to {return_sps:.0f} sps...")
@@ -350,10 +367,6 @@ def autocenter_vss(pi, args, k):
     last_dir = actual_dir
 
     for i in range(return_steps):
-        # Bail if we unexpectedly hit the other wall (shouldn't happen)
-        if _ac_btn(pi, active_low) and i > 200:
-            print(f"  Button during back-off at step {i} — stopping early.")
-            break
         period = _ac_period_us(i, return_steps, return_sps)
         last_dir = _ac_step_once(pi, step_pin, dir_pin,
                                   return_dir, dir_invert,
@@ -650,7 +663,6 @@ def _write_run_csv(log_buf, args, F_init):
     mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
 
     with open(path, 'w', newline='') as fh:
-        # ── Metadata header ───────────────────────────────────────────────────
         fh.write(f"# VSS hardware run — {datetime.datetime.now().isoformat(timespec='seconds')}\n")
         fh.write(f"# mu={args.mu}  mu_omega={mu_omega}  "
                  f"control_fs={args.control_fs}  log_hz={args.log_hz}\n")
@@ -662,7 +674,6 @@ def _write_run_csv(log_buf, args, F_init):
         fh.write(f"# dir_invert={args.dir_invert}  simulate={args.simulate}\n")
         fh.write(f"# NOTE: C_mm, S_mm, f_hz, A_mm are tone 1 only\n")
 
-        # ── Data ──────────────────────────────────────────────────────────────
         writer = csv.writer(fh)
         writer.writerow(['t_s', 'e_m_s2', 'C_mm', 'S_mm', 'f_hz', 'A_mm'])
         for i in range(n):
@@ -703,7 +714,6 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
     log_f = np.array(log_f)
     log_A = np.sqrt(log_C**2 + log_S**2)
 
-    # Rolling e_rms — 2-second window at log_hz
     window = max(1, int(2.0 * args.log_hz))
     e_rms = np.array([
         np.sqrt(np.mean(log_e[max(0, i - window):i + 1]**2))
@@ -720,7 +730,6 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
         fontsize=10
     )
 
-    # Panel 1 — residual error
     ax = axes[0]
     ax.plot(log_t, log_e, alpha=0.25, color='gray', linewidth=0.4, label='e(t)')
     ax.plot(log_t, e_rms, color='crimson', linewidth=1.5, label='e_rms (2s window)')
@@ -730,7 +739,6 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Panel 2 — actuator amplitude
     ax = axes[1]
     ax.plot(log_t, log_A, color='steelblue', linewidth=1.5)
     ax.axhline(args.max_amp_per_tone, color='red', linestyle='--',
@@ -740,7 +748,6 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Panel 3 — C and S coefficients
     ax = axes[2]
     ax.plot(log_t, log_C, linewidth=1.0, label='C  (cos coeff)', color='royalblue')
     ax.plot(log_t, log_S, linewidth=1.0, label='S  (sin coeff)', color='darkorange')
@@ -750,7 +757,6 @@ def plot_run(log_t, log_e, log_C, log_S, log_f, args):
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Panel 4 — tracked frequency
     ax = axes[3]
     ax.plot(log_t, log_f, color='seagreen', linewidth=1.5)
     if len(log_f):
@@ -782,13 +788,7 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
 
     PHASE FRAME — fixes the absolute-time phase bug
     ────────────────────────────────────────────────
-    Earlier versions evaluated  cos(2π·F·t + PHI)  using absolute time t.
-    When F changes between chunks (FFT tracker, gradient tracker), the
-    stepper's commanded phase jumps by  2π·ΔF·t  while the LMS's own phase
-    accumulator continues smoothly.  Result: every frequency update
-    re-randomizes the cancellation alignment.
-
-    Fix: step_phis is a per-tone phase accumulator that evolves identically
+    step_phis is a per-tone phase accumulator that evolves identically
     to the LMS phi accumulator (φ += ω·dt per substep).  It persists across
     chunk calls.  When F changes, step_phis continues from where it was —
     only the *rate* of evolution changes, never the value.
@@ -816,7 +816,6 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
                 step_phis[i] -= 2.0 * math.pi
 
     while t < t_end:
-        # NOTE: cos(step_phis[i] + PHI[i]), NOT cos(2π·F·t + PHI)
         v = sum(
             A[i] * omegas[i] * math.cos(step_phis[i] + PHI[i])
             for i in range(n_tones) if A[i] and F[i]
@@ -840,9 +839,6 @@ def compute_chunk(t_start, chunk_s, A, F, PHI, k,
                 0       if logical_dir else DIR_BIT,
                 dir_setup_us,
             ))
-            # NOTE: original code did NOT advance t for blanking/setup
-            # (small pre-existing timing bug, ~220 µs per direction change).
-            # Preserved here to avoid behavior change beyond the phase fix.
             current_dir = logical_dir
 
         period_us = max(MIN_PERIOD_US, int(round(1e6 / sps)))
@@ -875,56 +871,32 @@ class FFTFreqTracker(threading.Thread):
     its own gradient ω update when this thread is active, preserving a
     single-writer invariant without locks on the freq state itself
     (single-float writes are atomic under the GIL).
-
-    DESIGN NOTES
-    ────────────
-    • Window length controls bin resolution: Δf_bin = 1 / window_sec.
-      Parabolic interpolation around the peak typically reaches ~Δf_bin/20
-      for a clean single tone.
-
-    • Update interval should be ≥ window_sec/2.  Faster updates produce
-      correlated estimates (consecutive windows share most of their data)
-      without adding information.
-
-    • Per-update step is clamped to ±max_step_hz.  Originally introduced
-      to limit phase jumps caused by the absolute-time phase bug in
-      compute_chunk; that bug is now fixed (phase accumulator), so this
-      clamp's main remaining purpose is robustness against transient FFT
-      mis-locks (e.g., a noise spike briefly outranking the true peak).
-      A value of 0.05–0.10 Hz is reasonable for typical drift rates.
-
-    • Search band is [f_init - band_pad, f_init + band_pad] PER TONE.
-      Prevents the tracker from latching onto a resonance peak or harmonic
-      that's stronger than the disturbance fundamental.  band_pad should
-      bound the worst-case drift you observed in motor_drift_char.py.
     """
 
     def __init__(self, imu_buffer, buffer_lock, freqs_shared, freqs_lock,
                  fs, window_sec, update_sec, max_step_hz, band_pad_hz,
                  init_freqs, running):
         super().__init__(daemon=True, name="fft-tracker")
-        self.imu_buffer  = imu_buffer
-        self.buffer_lock = buffer_lock
-        self.freqs_shared = freqs_shared      # list[float], one per tone
-        self.freqs_lock  = freqs_lock         # protects multi-element reads
-        self.fs          = fs
-        self.N           = int(window_sec * fs)
-        self.update_sec  = update_sec
-        self.max_step    = max_step_hz
-        self.band_pad    = band_pad_hz
-        self.init_freqs  = list(init_freqs)
-        self.running     = running
-        self.hann        = np.hanning(self.N)
+        self.imu_buffer   = imu_buffer
+        self.buffer_lock  = buffer_lock
+        self.freqs_shared = freqs_shared
+        self.freqs_lock   = freqs_lock
+        self.fs           = fs
+        self.N            = int(window_sec * fs)
+        self.update_sec   = update_sec
+        self.max_step     = max_step_hz
+        self.band_pad     = band_pad_hz
+        self.init_freqs   = list(init_freqs)
+        self.running      = running
+        self.hann         = np.hanning(self.N)
 
-        # Diagnostics — read by status thread for printing
-        self.last_update_t  = 0.0
-        self.last_f_meas    = list(init_freqs)   # raw FFT result (pre-clamp)
-        self.update_count   = 0
-        self.skip_count     = 0   # times we skipped (buffer not full enough)
+        self.last_update_t = 0.0
+        self.last_f_meas   = list(init_freqs)
+        self.update_count  = 0
+        self.skip_count    = 0
 
     def _peak_in_band(self, spectrum, freqs_bin, f_lo, f_hi):
-        """Find dominant peak in [f_lo, f_hi] with parabolic interpolation."""
-        mask = (freqs_bin >= f_lo) & (freqs_bin <= f_hi)
+        mask     = (freqs_bin >= f_lo) & (freqs_bin <= f_hi)
         band_idx = np.where(mask)[0]
         if band_idx.size == 0:
             return None
@@ -934,7 +906,6 @@ class FFTFreqTracker(threading.Thread):
             y0, y1, y2 = spectrum[k-1], spectrum[k], spectrum[k+1]
             denom = (y0 - 2.0 * y1 + y2)
             delta = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
-            # Guard against runaway interpolation for non-parabolic peaks
             if abs(delta) > 1.0:
                 delta = 0.0
         else:
@@ -942,7 +913,6 @@ class FFTFreqTracker(threading.Thread):
         return (k + delta) * self.fs / self.N
 
     def run(self):
-        # Wait for buffer to fill before the first FFT
         while self.running[0]:
             with self.buffer_lock:
                 ready = len(self.imu_buffer) >= self.N
@@ -960,7 +930,6 @@ class FFTFreqTracker(threading.Thread):
                 continue
             next_t += self.update_sec
 
-            # Snapshot the most recent N samples
             with self.buffer_lock:
                 if len(self.imu_buffer) < self.N:
                     self.skip_count += 1
@@ -971,27 +940,21 @@ class FFTFreqTracker(threading.Thread):
             samples = samples - samples.mean()
             spec    = np.abs(np.fft.rfft(samples * self.hann))
 
-            # Per-tone search in a tight band around init freq
             new_freqs = []
             for i, f_init in enumerate(self.init_freqs):
-                f_lo = max(0.5, f_init - self.band_pad)
-                f_hi = f_init + self.band_pad
+                f_lo   = max(0.5, f_init - self.band_pad)
+                f_hi   = f_init + self.band_pad
                 f_peak = self._peak_in_band(spec, freqs_bin, f_lo, f_hi)
                 if f_peak is None:
-                    new_freqs.append(self.freqs_shared[i])  # keep current
+                    new_freqs.append(self.freqs_shared[i])
                     continue
                 self.last_f_meas[i] = float(f_peak)
-                # Clamp per-update step
                 with self.freqs_lock:
                     f_cur = self.freqs_shared[i]
                 step = f_peak - f_cur
-                if step > self.max_step:
-                    step = self.max_step
-                elif step < -self.max_step:
-                    step = -self.max_step
+                step = max(-self.max_step, min(self.max_step, step))
                 new_freqs.append(f_cur + step)
 
-            # Single bulk write under lock (multi-element atomicity)
             with self.freqs_lock:
                 for i, f_new in enumerate(new_freqs):
                     self.freqs_shared[i] = f_new
@@ -1008,31 +971,6 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                   args, running, lms_stats, log_buf, per_tone_max_amp,
                   freqs_shared, freqs_lock, imu_buffer, buffer_lock,
                   fft_tracker_active):
-    """
-    Runs at ~control_fs Hz.  Adapts amplitude (C, S) and, if the gradient
-    tracker is active (µ_omega > 0 AND fft_tracker_active is False),
-    frequency (ω) for each tone.  Logs state to log_buf at --log_hz rate.
-
-    per_tone_max_amp is a list of per-tone amplitude limits (mm), derived
-    from --max_amp_per_tone and the per-tone sps constraint.
-
-    KEY DESIGN: Phase accumulator
-    ─────────────────────────────
-    φᵢ += ωᵢ · dt each sample replaces ωᵢ·t so that when ω changes
-    the phase evolves continuously with no discontinuity.
-
-    KEY DESIGN: Single-writer freq invariant
-    ────────────────────────────────────────
-    Frequency state lives in freqs_shared.  Exactly one thread writes it:
-      • If fft_tracker_active: the FFT thread is sole writer.
-        The gradient ω update here is skipped.
-      • Otherwise: this thread is sole writer (via the gradient update),
-        and freqs_shared is updated each iteration.
-    Either way, no write-write races on the freq state.
-
-    Frequency gradient (gradient mode only):
-      ∂x/∂ω ≈ Sᵢ·cos(φᵢ) − Cᵢ·sin(φᵢ)   (quadrature signal)
-    """
     n        = len(freqs)
     phis     = [0.0] * n
     period   = 1.0 / args.control_fs
@@ -1043,8 +981,7 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
 
     log_every  = max(1, int(args.control_fs / args.log_hz))
     log_ticker = 0
-
-    next_t = time.monotonic()
+    next_t     = time.monotonic()
 
     while running[0]:
         now = time.monotonic()
@@ -1052,32 +989,24 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
             time.sleep(next_t - now)
             now = time.monotonic()
 
-        # ── Read the latest shared frequencies (FFT tracker may have updated) ─
         with freqs_lock:
             omegas = [2.0 * math.pi * f for f in freqs_shared]
 
-        # ── Advance phase accumulators ────────────────────────────────────────
         for i in range(n):
             phis[i] += omegas[i] * dt
             if phis[i] > math.pi:
                 phis[i] -= 2.0 * math.pi
 
-        # ── Read error signal ─────────────────────────────────────────────────
         if args.simulate:
             with lms_lock:
                 snap = [list(c) for c in lms_coeffs]
-            t_sim = now - t_start
-            e = sim_read_accel(t_sim, snap, freqs, args.sim_plant_gain)
+            e = sim_read_accel(now - t_start, snap, freqs, args.sim_plant_gain)
         else:
             e = hw_read_accel()
 
-        # ── Push to IMU ring buffer for the FFT tracker ──────────────────────
-        # deque.append is thread-safe under the GIL; the lock is only needed
-        # when we want a self-consistent snapshot of N elements (FFT thread).
         with buffer_lock:
             imu_buffer.append(e)
 
-        # ── LMS gradient steps ────────────────────────────────────────────────
         with lms_lock:
             for i in range(n):
                 cos_ref = math.cos(phis[i])
@@ -1095,13 +1024,11 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
                     f_hz = max(args.min_freq, min(args.max_freq, f_hz))
                     omegas[i] = 2.0 * math.pi * f_hz
 
-            # Each tone clamped to its own sps-derived limit
             clamp_coeffs(lms_coeffs, per_tone_max_amp, args.max_total_amp)
 
             for i in range(n):
                 lms_freqs[i] = omegas[i] / (2.0 * math.pi)
 
-        # ── Write back freqs_shared if we (the LMS) are the sole writer ──────
         if gradient_freq_active:
             with freqs_lock:
                 for i in range(n):
@@ -1111,7 +1038,6 @@ def lms_thread_fn(freqs, lms_coeffs, lms_freqs, lms_lock, t_start,
         lms_stats['t']     = now - t_start
         lms_stats['freqs'] = [o / (2.0 * math.pi) for o in omegas]
 
-        # ── Periodic logging ──────────────────────────────────────────────────
         log_ticker += 1
         if log_ticker >= log_every:
             log_ticker = 0
@@ -1191,11 +1117,8 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     Initialises LMS coefficients, starts LMS and status threads,
     then runs the DMA double-buffer stepper loop.
 
-    per_tone_max_amp : list of float
-        Per-tone amplitude limits (mm), one per tone.  Computed in main()
-        as min(--max_amp_per_tone, sps-derived limit for that tone's frequency).
-        Each tone is clamped independently so low-frequency tones are not
-        penalised by the tighter constraint that applies to high-frequency tones.
+    BUTTON_PIN is polled once per chunk boundary (~50 ms).  If the carriage
+    reaches a wall during cancellation the loop exits cleanly with a message.
     """
     print(f"\n{'─'*56}")
     print(f"  PHASE 2 — CANCEL")
@@ -1211,7 +1134,6 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     print(f"  Frequency tracking: "
           f"{'ON  (µ_omega=' + str(mu_omega) + ')' if freq_tracking else 'OFF'}")
 
-    # ── Initialise LMS coefficients ───────────────────────────────────────────
     lms_coeffs = []
     for i, (f, accel_amp) in enumerate(tones):
         if args.init_amp_gain > 0 and accel_amp > 0:
@@ -1238,11 +1160,9 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     chunk_s     = args.chunk_ms / 1000.0
     log_buf     = {'t': [], 'e': [], 'C': [], 'S': [], 'f': []}
 
-    # ── Shared frequency state (single-writer invariant) ─────────────────────
     freqs_shared = list(F_init)
     freqs_lock   = threading.Lock()
 
-    # ── IMU ring buffer for the FFT tracker ──────────────────────────────────
     imu_buf_len  = int(args.fft_window_sec * args.control_fs * 1.5) + 100
     imu_buffer   = deque(maxlen=imu_buf_len)
     buffer_lock  = threading.Lock()
@@ -1254,21 +1174,22 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
         if mu_omega > 0:
             print(f"    Note: gradient ω update auto-disabled (FFT is sole writer)")
 
-    # ── GPIO setup ────────────────────────────────────────────────────────────
-    # Note: if autocenter ran first, these pins are already configured.
-    # Re-applying set_mode is harmless and guarantees correct state.
+    # GPIO setup — re-applying set_mode after autocenter is harmless
     pi.set_mode(args.dir,   pigpio.OUTPUT)
     pi.set_mode(args.step,  pigpio.OUTPUT)
     pi.set_mode(ENABLE_PIN, pigpio.OUTPUT)
-    pi.write(ENABLE_PIN, 1)   # enable backstop interlock
+    pi.write(ENABLE_PIN, 1)
     pi.wave_clear()
+
+    if not args.simulate:
+        pi.set_mode(BUTTON_PIN, pigpio.INPUT)
+        pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
 
     pi.write(args.dir, 1)
     time.sleep(args.dir_setup_us / 1e6)
 
     t_wall_start = time.monotonic()
 
-    # ── Spawn threads ─────────────────────────────────────────────────────────
     lms_t = threading.Thread(
         target=lms_thread_fn,
         args=(F_init, lms_coeffs, lms_freqs, lms_lock,
@@ -1276,25 +1197,24 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
               per_tone_max_amp,
               freqs_shared, freqs_lock, imu_buffer, buffer_lock,
               args.fft_tracker),
-        daemon=True,
-        name="lms-imu",
+        daemon=True, name="lms-imu",
     )
     lms_t.start()
 
     fft_t = None
     if args.fft_tracker:
         fft_t = FFTFreqTracker(
-            imu_buffer    = imu_buffer,
-            buffer_lock   = buffer_lock,
-            freqs_shared  = freqs_shared,
-            freqs_lock    = freqs_lock,
-            fs            = args.control_fs,
-            window_sec    = args.fft_window_sec,
-            update_sec    = args.fft_update_sec,
-            max_step_hz   = args.fft_max_step_hz,
-            band_pad_hz   = args.fft_band_pad_hz,
-            init_freqs    = F_init,
-            running       = running,
+            imu_buffer   = imu_buffer,
+            buffer_lock  = buffer_lock,
+            freqs_shared = freqs_shared,
+            freqs_lock   = freqs_lock,
+            fs           = args.control_fs,
+            window_sec   = args.fft_window_sec,
+            update_sec   = args.fft_update_sec,
+            max_step_hz  = args.fft_max_step_hz,
+            band_pad_hz  = args.fft_band_pad_hz,
+            init_freqs   = F_init,
+            running      = running,
         )
         fft_t.start()
 
@@ -1302,8 +1222,7 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
         target=status_thread_fn,
         args=(pi, lms_coeffs, lms_lock, shared, shared_lock,
               args, running, F_init, lms_stats, per_tone_max_amp),
-        daemon=True,
-        name="status",
+        daemon=True, name="status",
     )
     stat_t.start()
 
@@ -1311,8 +1230,6 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     s_est      = 0.0
     last_dir   = 1
     t_end_wall = (t_wall_start + args.cancel_dur) if args.cancel_dur > 0 else None
-
-    # Per-tone stepper phase accumulators — see compute_chunk docstring.
     step_phis  = [0.0] * n
 
     est_peak_sps = sum(
@@ -1327,7 +1244,8 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     print(f"  Logging at {args.log_hz:.0f} Hz → plot_out={args.plot_out}")
     print("  Ctrl-C to stop.\n")
 
-    # ── Compute and fire first chunk ──────────────────────────────────────────
+    backstop_tripped = False
+
     with lms_lock:
         A, PHI = coeffs_to_aphi(lms_coeffs)
     with freqs_lock:
@@ -1347,16 +1265,23 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     pi.wave_send_once(wave_c)
     t_chunk_wall = time.monotonic()
 
-    # ── Double-buffer main loop ───────────────────────────────────────────────
     try:
         while True:
             if t_end_wall and time.monotonic() >= t_end_wall:
                 break
 
+            # ── Backstop safety check (once per chunk, ~50 ms) ────────────────
+            # Both end-stops share BUTTON_PIN.  A press during cancellation
+            # means the carriage has drifted to a wall — most likely LMS
+            # divergence or µ too large.  Stop now rather than grinding.
+            if not args.simulate and _btn(pi, args.button_active_low):
+                backstop_tripped = True
+                break
+
             with lms_lock:
                 A, PHI = coeffs_to_aphi(lms_coeffs)
             with freqs_lock:
-                F_cur  = list(freqs_shared)
+                F_cur = list(freqs_shared)
 
             pulses_n, dir_n, t_next, steps_n = compute_chunk(
                 t_phase, chunk_s, A, F_cur, PHI, k,
@@ -1421,7 +1346,19 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
             pi.write(ENABLE_PIN, 0)
         except Exception:
             pass
-        print("\nCancellation stopped.")
+
+        print()
+        if backstop_tripped:
+            print("!" * 56)
+            print("  BACKSTOP TRIGGERED — carriage hit a wall.")
+            print("  Motor stopped.  This typically means the LMS")
+            print("  amplitude grew unchecked (µ too large, or plant")
+            print("  phase error preventing convergence).")
+            print(f"  x_est at stop: {s_est/k:+.2f} mm")
+            print("!" * 56)
+        else:
+            print("Cancellation stopped.")
+
         print(f"Final x_est = {s_est / k:+.2f} mm  ({int(s_est):+d} steps)")
 
         with lms_lock:
@@ -1464,9 +1401,7 @@ def main():
 
     k = k_steps_per_mm(args.pulley_d_mm, args.pulses_per_rev)
 
-    mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
-
-    # Autocenter is skipped automatically in simulate mode (no real GPIO)
+    mu_omega      = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
     autocenter_on = (not args.no_autocenter) and (not args.simulate)
 
     print("═" * 56)
@@ -1481,7 +1416,6 @@ def main():
           f"({'tracking ON' if mu_omega > 0 else 'tracking OFF'})")
     print(f"  autocenter = {'ON' if autocenter_on else 'OFF'}")
 
-    # ── Connect to pigpiod (needed by both autocenter and cancellation) ────────
     pi = None
     if not args.simulate:
         pi = pigpio.pi()
@@ -1490,11 +1424,9 @@ def main():
                      "Start with:  sudo pigpiod -s 2 -b 4096")
 
     try:
-        # ── Phase 0: Auto-center ───────────────────────────────────────────────
         if autocenter_on:
             autocenter_vss(pi, args, k)
 
-        # ── Phase 1: Identify ──────────────────────────────────────────────────
         if args.skip_id:
             if not args.manual_freqs:
                 sys.exit("ERROR: --skip_id requires at least one --manual_freqs value.")
@@ -1511,7 +1443,6 @@ def main():
                     f"Try longer --id_dur, wider band, or --simulate."
                 )
 
-        # ── Compute per-tone amplitude limits ──────────────────────────────────
         per_tone_max_amp = []
         for f, _ in tones:
             sps_at_max = args.max_amp_per_tone * 2 * math.pi * f * k
@@ -1523,21 +1454,21 @@ def main():
             else:
                 per_tone_max_amp.append(args.max_amp_per_tone)
 
-        # ── Phase 2: Cancel ────────────────────────────────────────────────────
         if args.simulate:
-            # Stub pigpio for simulation — no real GPIO
             class _SimPi:
-                def wave_clear(self):          pass
-                def set_mode(self, *a):        pass
-                def write(self, *a):           pass
+                def wave_clear(self):           pass
+                def set_mode(self, *a):         pass
+                def write(self, *a):            pass
+                def read(self, *a):             return 0   # button never fires in sim
+                def set_pull_up_down(self, *a): pass
                 def wave_add_generic(self, *a): pass
-                def wave_create(self):         return 0
-                def wave_send_once(self, *a):  pass
-                def wave_tx_busy(self):        return False
-                def wave_delete(self, *a):     pass
-                def wave_tx_stop(self):        pass
-                def get_current_tick(self):    return 0
-                def stop(self):                pass
+                def wave_create(self):          return 0
+                def wave_send_once(self, *a):   pass
+                def wave_tx_busy(self):         return False
+                def wave_delete(self, *a):      pass
+                def wave_tx_stop(self):         pass
+                def get_current_tick(self):     return 0
+                def stop(self):                 pass
             pi_run = _SimPi()
         else:
             pi_run = pi
