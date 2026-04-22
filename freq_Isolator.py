@@ -52,11 +52,43 @@ def read_accel_sample_simulated(t: float) -> float:
     return a + b + n
 
 
-def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tuple[np.ndarray, np.ndarray, float]:
+def _live_bar(val: float, scale: float = 20.0, width: int = 40) -> str:
+    """
+    Render a signed ASCII bar for `val`.
+
+    Positive values fill right of centre with '█', negative fill left with '░'.
+    `scale` is the ±full-scale value (m/s²).
+
+    Example at val=+8, scale=20, width=40:
+      '         [         ████████            ]  +8.000'
+    """
+    half    = width // 2
+    clamped = max(-scale, min(scale, val))
+    filled  = int(round(abs(clamped) / scale * half))
+    filled  = min(filled, half)
+
+    if clamped >= 0:
+        bar = " " * half + "█" * filled + " " * (half - filled)
+    else:
+        bar = " " * (half - filled) + "░" * filled + " " * half
+
+    return f"[{bar}]"
+
+
+def collect_time_series(
+    duration_s: float,
+    fs_hz: float,
+    simulate: bool,
+    live_hz: float = 0.0,
+    live_scale: float = 20.0,
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Collect N = duration*fs samples at ~fs rate.
     Returns (samples, timestamps, measured_fs).
     Timestamps are seconds elapsed from t0.
+
+    live_hz   : if > 0, print a live status line at this rate while sampling.
+    live_scale : ±full-scale value for the ASCII bar (m/s²).
     """
     if duration_s <= 0:
         raise ValueError("duration must be > 0")
@@ -70,9 +102,21 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
     samples  = np.zeros(n_target, dtype=float)
     t_stamps = np.zeros(n_target, dtype=float)
 
+    live        = live_hz > 0
+    live_period = 1.0 / live_hz if live else float("inf")
+    next_live_t = 0.0          # elapsed seconds; trigger immediately at i=0
+
+    # Rolling peak — reset every live frame for a "peak hold" feel
+    rolling_peak = 0.0
+    peak_decay   = 0.85        # multiply each live frame → gentle fall-off
+
     period = 1.0 / fs_hz
     t0     = time.perf_counter()
     next_t = t0
+
+    if live:
+        print(f"  Sampling {duration_s:.1f}s @ {fs_hz:.0f}Hz  "
+              f"(live display {live_hz:.1f}Hz, ±{live_scale:.0f} m/s²)\n")
 
     for i in range(n_target):
         now = time.perf_counter()
@@ -83,24 +127,41 @@ def collect_time_series(duration_s: float, fs_hz: float, simulate: bool) -> Tupl
 
         t = now - t0
 
-        t_before_read = time.perf_counter()
         if simulate:
             val = read_accel_sample_simulated(t)
         else:
             val = read_accel_sample()
-        t_after_read = time.perf_counter()
 
         samples[i]  = val
-        t_stamps[i] = t          # elapsed seconds from t0
+        t_stamps[i] = t
 
-        if i % 100 == 0:
-            read_dt_ms = (t_after_read - t_before_read) * 1000
-            print(f"i={i}  t={t:.3f}s  read_dt={read_dt_ms:.2f} ms")
+        # ── Live display ──────────────────────────────────────────────────────
+        if live and t >= next_live_t:
+            rolling_peak = max(abs(val), rolling_peak * peak_decay)
+            pct_done     = 100.0 * i / max(n_target - 1, 1)
+            bar          = _live_bar(val, scale=live_scale)
+            peak_marker  = f"pk={rolling_peak:5.2f}"
+
+            # \r overwrites the line in place; end="" suppresses newline
+            print(
+                f"\r  {t:6.2f}s / {duration_s:.1f}s  "
+                f"[{pct_done:5.1f}%]  "
+                f"{bar}  "
+                f"{val:+7.3f} m/s²  "
+                f"{peak_marker}",
+                end="",
+                flush=True,
+            )
+            next_live_t += live_period
 
         next_t += period
 
+    if live:
+        # Final newline so the next print() starts on a clean line
+        print()
+
     # estimate actual fs from timestamps
-    dt     = np.diff(t_stamps)
+    dt      = np.diff(t_stamps)
     fs_meas = 1.0 / np.mean(dt) if len(dt) > 0 else fs_hz
     return samples, t_stamps, fs_meas
 
@@ -299,13 +360,19 @@ def main():
     ap.add_argument("--simulate",      action="store_true",        help="use simulated accel instead of hardware")
     ap.add_argument("--save-data",     type=str,   default=None,  help="path to save raw time-series CSV (time_s, accel_ms2)")
     ap.add_argument("--save-spectrum", type=str,   default=None,  help="path to save spectrum CSV (freq_hz, amp)")
-    ap.add_argument("--plot",          action="store_true",        help="save a two-panel plot (time series + FFT spectrum)")
+    ap.add_argument("--live",          action="store_true",        help="print a live accelerometer readout while sampling")
+    ap.add_argument("--live-hz",       type=float, default=10.0,   help="live display update rate in Hz (default 10)")
+    ap.add_argument("--live-scale",    type=float, default=20.0,   help="±full-scale for the live bar display in m/s² (default 20)")
     ap.add_argument("--plot-out",      type=str,   default="spectrum_plot.png",
                     help="output path for the plot image (default: spectrum_plot.png)")
     args = ap.parse_args()
 
     # ── Collect ──────────────────────────────────────────────────────────────
-    x, t_stamps, fs_meas = collect_time_series(args.duration, args.fs, args.simulate)
+    x, t_stamps, fs_meas = collect_time_series(
+        args.duration, args.fs, args.simulate,
+        live_hz=args.live_hz if args.live else 0.0,
+        live_scale=args.live_scale,
+    )
 
     # ── Spectral analysis ─────────────────────────────────────────────────────
     freqs, amps = single_sided_fft_amplitude(x, fs_meas, window=args.window)
