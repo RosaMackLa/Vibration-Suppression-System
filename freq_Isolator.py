@@ -52,27 +52,109 @@ def read_accel_sample_simulated(t: float) -> float:
     return a + b + n
 
 
-def _live_bar(val: float, scale: float = 20.0, width: int = 40) -> str:
-    """
-    Render a signed ASCII bar for `val`.
+# ── ANSI colour palette ───────────────────────────────────────────────────────
+_R   = "\033[0m"          # reset
+_B   = "\033[1m"          # bold
+_DIM = "\033[2m"
+_CYN = "\033[96m"         # bright cyan
+_GRN = "\033[92m"         # bright green
+_YLW = "\033[93m"         # bright yellow
+_RED = "\033[91m"         # bright red
+_MAG = "\033[95m"         # bright magenta
+_WHT = "\033[97m"         # bright white
 
-    Positive values fill right of centre with '█', negative fill left with '░'.
-    `scale` is the ±full-scale value (m/s²).
+# Sparkline character ramp (9 levels, index 0 = blank)
+_SPARK = " ▁▂▃▄▅▆▇█"
 
-    Example at val=+8, scale=20, width=40:
-      '         [         ████████            ]  +8.000'
+# ANSI cursor control
+_UP   = "\033[{n}A"       # move cursor up n lines
+_CLR  = "\033[K"          # clear to end of line
+
+
+def _mag_color(frac: float) -> str:
+    """Return ANSI color code based on fraction of full-scale (0→1)."""
+    if frac < 0.33:
+        return _GRN
+    if frac < 0.66:
+        return _YLW
+    return _RED
+
+
+def _render_live_display(
+    val: float,
+    scale: float,
+    spark_buf: list,
+    t: float,
+    duration_s: float,
+    sample_idx: int,
+    n_total: int,
+    rolling_peak: float,
+    spark_width: int = 60,
+) -> list:
     """
-    half    = width // 2
+    Build a 3-line live display and return as a list of strings (no newlines).
+
+    Line 0 — progress + stats
+    Line 1 — rolling sparkline waveform (last ~4 s of history)
+    Line 2 — signed colour bar + numeric value
+    """
+    pct   = 100.0 * sample_idx / max(n_total - 1, 1)
+    frac  = min(abs(val) / max(scale, 1e-9), 1.0)
+    color = _mag_color(frac)
+
+    # ── Line 0: progress bar + stats ──────────────────────────────────────────
+    prog_w    = 24
+    prog_fill = int(round(pct / 100.0 * prog_w))
+    prog_bar  = f"{_GRN}{'█' * prog_fill}{_DIM}{'░' * (prog_w - prog_fill)}{_R}"
+
+    line0 = (
+        f"  {_CYN}{_B}{t:6.2f}s{_R} / {_DIM}{duration_s:.1f}s{_R}"
+        f"  [{prog_bar}]  {_DIM}{pct:5.1f}%{_R}"
+        f"  {color}{_B}{val:+9.4f} m/s²{_R}"
+        f"  pk={_YLW}{_B}{rolling_peak:6.3f}{_R}"
+    )
+
+    # ── Line 1: sparkline ─────────────────────────────────────────────────────
+    buf = spark_buf
+    n_buf = len(buf)
+
+    if n_buf >= spark_width:
+        bucket = n_buf // spark_width
+        buckets = [buf[j * bucket: (j + 1) * bucket] for j in range(spark_width)]
+    elif n_buf > 0:
+        # Pad left with zeros until we have a full screen of history
+        pad = spark_width - n_buf
+        buckets = [[0.0]] * pad + [[v] for v in buf]
+    else:
+        buckets = [[0.0]] * spark_width
+
+    bucket_peaks = [max(abs(v) for v in b) if b else 0.0 for b in buckets]
+    local_max    = max(bucket_peaks) if bucket_peaks else 1.0
+
+    chars = []
+    for bp in bucket_peaks:
+        f2   = bp / max(local_max, 1e-9)
+        idx  = min(int(round(f2 * 8)), 8)
+        col  = _mag_color(f2)
+        chars.append(f"{col}{_SPARK[idx]}{_R}")
+
+    line1 = f"  {''.join(chars)}  {_DIM}← {n_buf} samples{_R}"
+
+    # ── Line 2: signed bar ────────────────────────────────────────────────────
+    half    = 30
     clamped = max(-scale, min(scale, val))
-    filled  = int(round(abs(clamped) / scale * half))
-    filled  = min(filled, half)
+    filled  = min(int(round(abs(clamped) / scale * half)), half)
 
     if clamped >= 0:
-        bar = " " * half + "█" * filled + " " * (half - filled)
+        bar_inner = f"{_DIM}{' ' * half}{_R}{color}{'█' * filled}{_R}{' ' * (half - filled)}"
     else:
-        bar = " " * (half - filled) + "░" * filled + " " * half
+        bar_inner = f"{' ' * (half - filled)}{color}{'░' * filled}{_R}{_DIM}{' ' * half}{_R}"
 
-    return f"[{bar}]"
+    # Centre tick mark
+    centre_tick = f"{_DIM}│{_R}"
+    line2 = f"  [{bar_inner[:half]}{centre_tick}{bar_inner[half:]}]  {color}{_B}{val:+8.3f}{_R} m/s²"
+
+    return [line0, line1, line2]
 
 
 def collect_time_series(
@@ -87,8 +169,8 @@ def collect_time_series(
     Returns (samples, timestamps, measured_fs).
     Timestamps are seconds elapsed from t0.
 
-    live_hz   : if > 0, print a live status line at this rate while sampling.
-    live_scale : ±full-scale value for the ASCII bar (m/s²).
+    live_hz    : if > 0, render a 3-line ANSI live display at this rate.
+    live_scale : ±full-scale value for the bar / sparkline (m/s²).
     """
     if duration_s <= 0:
         raise ValueError("duration must be > 0")
@@ -102,21 +184,29 @@ def collect_time_series(
     samples  = np.zeros(n_target, dtype=float)
     t_stamps = np.zeros(n_target, dtype=float)
 
-    live        = live_hz > 0
-    live_period = 1.0 / live_hz if live else float("inf")
-    next_live_t = 0.0          # elapsed seconds; trigger immediately at i=0
+    live         = live_hz > 0
+    live_period  = 1.0 / live_hz if live else float("inf")
+    next_live_t  = 0.0
 
-    # Rolling peak — reset every live frame for a "peak hold" feel
+    # Sparkline history — keep up to ~4 s of raw samples
+    spark_maxlen = max(512, int(fs_hz * 4))
+    spark_buf    = []
+
     rolling_peak = 0.0
-    peak_decay   = 0.85        # multiply each live frame → gentle fall-off
+    peak_decay   = 0.85
+    n_live_lines = 3
+    first_frame  = True
 
     period = 1.0 / fs_hz
     t0     = time.perf_counter()
     next_t = t0
 
     if live:
-        print(f"  Sampling {duration_s:.1f}s @ {fs_hz:.0f}Hz  "
-              f"(live display {live_hz:.1f}Hz, ±{live_scale:.0f} m/s²)\n")
+        print(
+            f"\n  {_CYN}{_B}VSS FREQ ISOLATOR  —  LIVE CAPTURE{_R}  "
+            f"{_DIM}{duration_s:.1f}s @ {fs_hz:.0f} Hz  "
+            f"display {live_hz:.1f} Hz  ±{live_scale:.0f} m/s²{_R}\n"
+        )
 
     for i in range(n_target):
         now = time.perf_counter()
@@ -135,32 +225,35 @@ def collect_time_series(
         samples[i]  = val
         t_stamps[i] = t
 
+        # Maintain sparkline history buffer
+        spark_buf.append(val)
+        if len(spark_buf) > spark_maxlen:
+            spark_buf = spark_buf[spark_maxlen // 4:]
+
         # ── Live display ──────────────────────────────────────────────────────
         if live and t >= next_live_t:
             rolling_peak = max(abs(val), rolling_peak * peak_decay)
-            pct_done     = 100.0 * i / max(n_target - 1, 1)
-            bar          = _live_bar(val, scale=live_scale)
-            peak_marker  = f"pk={rolling_peak:5.2f}"
 
-            # \r overwrites the line in place; end="" suppresses newline
-            print(
-                f"\r  {t:6.2f}s / {duration_s:.1f}s  "
-                f"[{pct_done:5.1f}%]  "
-                f"{bar}  "
-                f"{val:+7.3f} m/s²  "
-                f"{peak_marker}",
-                end="",
-                flush=True,
+            lines = _render_live_display(
+                val, live_scale, spark_buf,
+                t, duration_s, i, n_target, rolling_peak,
             )
+
+            if not first_frame:
+                print(f"\033[{n_live_lines}A", end="")
+            else:
+                first_frame = False
+
+            for line in lines:
+                print(f"\r{line}\033[K")
+
             next_live_t += live_period
 
         next_t += period
 
     if live:
-        # Final newline so the next print() starts on a clean line
         print()
 
-    # estimate actual fs from timestamps
     dt      = np.diff(t_stamps)
     fs_meas = 1.0 / np.mean(dt) if len(dt) > 0 else fs_hz
     return samples, t_stamps, fs_meas
