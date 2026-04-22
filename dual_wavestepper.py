@@ -474,7 +474,7 @@ def parse_args():
     # Auto-centering
     p.add_argument("--autocenter",         action="store_true",
                    help="Run auto-centering routine before starting pattern")
-    p.add_argument("--approach_sps",       type=float, default=1000.0,
+    p.add_argument("--approach_sps",       type=float, default=3000.0,
                    help="Step rate during wall approach [sps]  (default 1000 — slow & gentle)")
     p.add_argument("--return_sps",         type=float, default=4000.0,
                    help="Max step rate during back-off to centre [sps]  (default 4000)")
