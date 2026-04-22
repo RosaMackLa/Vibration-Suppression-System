@@ -456,6 +456,7 @@ def main():
     ap.add_argument("--live",          action="store_true",        help="print a live accelerometer readout while sampling")
     ap.add_argument("--live-hz",       type=float, default=10.0,   help="live display update rate in Hz (default 10)")
     ap.add_argument("--live-scale",    type=float, default=20.0,   help="±full-scale for the live bar display in m/s² (default 20)")
+    ap.add_argument("--plot",          action="store_true",        help="save a two-panel plot (time series + FFT spectrum)")
     ap.add_argument("--plot-out",      type=str,   default="spectrum_plot.png",
                     help="output path for the plot image (default: spectrum_plot.png)")
     args = ap.parse_args()
