@@ -4,10 +4,11 @@ vss_controller.py  —  VSS closed-loop adaptive vibration suppression
 
 PIPELINE
 ────────
-  PHASE 1 — IDENTIFY : sample IMU for --id_dur seconds, FFT, pick top ≤N tones
-  PHASE 2 — CANCEL   : DMA waveform stepper at identified frequencies;
-                        LMS thread continuously adapts (C, S, ω) coefficients
-                        to minimise residual IMU acceleration
+  PHASE 0 — AUTOCENTER : (default ON) step carriage to wall, back off to centre
+  PHASE 1 — IDENTIFY   : sample IMU for --id_dur seconds, FFT, pick top ≤N tones
+  PHASE 2 — CANCEL     : DMA waveform stepper at identified frequencies;
+                          LMS thread continuously adapts (C, S, ω) coefficients
+                          to minimise residual IMU acceleration
 
 CONTROL LAW (per tone i, ωᵢ = 2πfᵢ)
 ──────────────────────────────────────
@@ -64,6 +65,19 @@ AMPLITUDE CLAMPING
   is computed in main() and threaded through to clamp_coeffs so that the 9.3 Hz
   tone is not penalised by the 28 Hz tone's tighter sps limit.
 
+AUTO-CENTERING  (Phase 0)
+─────────────────────────
+  On by default; disable with --no_autocenter.
+  Uses bit-bang GPIO to step the carriage at --approach_sps toward the
+  backstop button (BCM 17), then drives back --center_mm with a trapezoidal
+  velocity ramp.  Guarantees a known start position before the DMA engine
+  takes over.  Automatically skipped in --simulate mode.
+
+  Algorithm:
+    1. If button already pressed → skip approach, go straight to back-off.
+    2. Step slowly until button fires OR safety step limit hit.
+    3. Pause 250 ms, then back off --center_mm with trapezoidal ramp.
+
 LOGGING & PLOTTING
 ──────────────────
   LMS state (t, e, C, S, f) is logged at --log_hz (default 100 Hz) into
@@ -73,20 +87,24 @@ LOGGING & PLOTTING
 
 USAGE
 ─────
-  # Real hardware (Pi 4B with DM556 + LSM6DSO):
-  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
+  # Real hardware — auto-center, identify, then cancel:
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \\
       --id_dur 30 --dir_invert --max_sps 50000
 
-  # Single known tone, fast µ:
-  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
-      --skip_id --manual_freqs 9.3 --mu 1e-3 --mu_omega 0 \
+  # Skip auto-center (carriage already centred):
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \\
+      --no_autocenter --id_dur 30 --dir_invert --max_sps 50000
+
+  # Single known tone, fast µ, skip centering:
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \\
+      --no_autocenter --skip_id --manual_freqs 9.3 --mu 1e-3 --mu_omega 0 \\
       --max_sps 50000 --max_amp_per_tone 9 --cancel_dur 120 --dir_invert
 
   # Simulation (any machine):
   python3 vss_controller.py --simulate --id_dur 5 --mu 5e-3
 
   # Adaptive frequency tracking enabled:
-  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \
+  sudo chrt -f 50 /home/vibess/vss-venv/bin/python3 vss_controller.py \\
       --id_dur 30 --dir_invert --max_sps 50000 --mu 5e-4 --mu_omega 5e-6
 """
 
@@ -124,7 +142,16 @@ HALF_TRAVEL_MM         = 75.0
 DEFAULT_STEP_BCM       = 13        # PWM1 — avoids snd_bcm2835 conflict
 DEFAULT_DIR_BCM        = 16
 PULSE_HIGH_US          = 5
-ENABLE_PIN             = 25
+ENABLE_PIN             = 25        # backstop interlock output (active HIGH = enabled)
+
+# Backstop button input pin
+BUTTON_PIN             = 17        # BCM 17 — active HIGH by default (1 = pressed)
+
+# Auto-centering bit-bang timing
+# These are separate from PULSE_HIGH_US which is for DMA waveform generation.
+AC_STEP_WIDTH_US   = 2             # STEP pin high time during bit-bang centering
+AC_DIR_SETUP_US    = 20            # DIR settle before first step after dir change
+AC_DIR_BLANKING_US = 200           # Unused in autocenter but kept for parity
 
 DEFAULT_SIM_PLANT_GAIN = 0.01      # m/s² per mm of counterweight displacement
 
@@ -180,6 +207,163 @@ def k_steps_per_mm(pulley_d_mm: float, pulses_per_rev: float) -> float:
     return pulses_per_rev / (math.pi * pulley_d_mm)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Auto-centering  (Phase 0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ac_btn(pi, active_low=False):
+    """Return True if the backstop button is currently pressed."""
+    val = pi.read(BUTTON_PIN)
+    return (val == 0) if active_low else (val == 1)
+
+
+def _ac_step_once(pi, step_pin, dir_pin, direction, dir_invert,
+                  last_actual_dir, period_us):
+    """
+    Bit-bang one step pulse on `step_pin` at the given period.
+
+    direction       : +1 or -1 in logical (pre-invert) space
+    last_actual_dir : last DIR-pin state in hardware space (+1 or -1)
+
+    Returns updated last_actual_dir.
+    """
+    actual_dir = direction * (-1 if dir_invert else 1)
+    if actual_dir != last_actual_dir:
+        pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+        time.sleep(AC_DIR_SETUP_US * 1e-6)
+    pi.write(step_pin, 1)
+    time.sleep(AC_STEP_WIDTH_US * 1e-6)
+    pi.write(step_pin, 0)
+    remainder = period_us - AC_STEP_WIDTH_US
+    if remainder > 0:
+        time.sleep(remainder * 1e-6)
+    return actual_dir
+
+
+def _ac_period_us(step_idx, total_steps, max_sps, min_sps=800, ramp_frac=0.20):
+    """
+    Trapezoidal velocity profile for the back-off move.
+
+    Ramps from min_sps → max_sps over the first ramp_frac fraction of steps,
+    cruises, then ramps back down.  Prevents stall on cold start.
+    """
+    ramp = max(1, int(total_steps * ramp_frac))
+    if step_idx < ramp:
+        sps = min_sps + (max_sps - min_sps) * (step_idx / ramp)
+    elif step_idx > total_steps - ramp:
+        sps = min_sps + (max_sps - min_sps) * ((total_steps - step_idx) / ramp)
+    else:
+        sps = max_sps
+    return int(1e6 / max(sps, 1.0))
+
+
+def autocenter_vss(pi, args, k):
+    """
+    Auto-center the VSS X-axis carriage (Phase 0).
+
+    Sets up STEP, DIR, ENABLE_PIN, and BUTTON_PIN, then:
+      1. Creeps toward the wall at approach_sps until button fires.
+      2. Pauses 250 ms.
+      3. Backs off center_mm with a trapezoidal velocity ramp.
+
+    This runs before any wave_add_generic call, so there is no conflict
+    with the pigpio DMA allocator.
+    """
+    step_pin    = args.step
+    dir_pin     = args.dir
+    dir_invert  = args.dir_invert
+    approach_dir = args.approach_dir
+    approach_sps = args.approach_sps
+    return_sps   = args.return_sps
+    center_mm    = args.center_mm
+    active_low   = args.button_active_low
+
+    MAX_APPROACH_STEPS = int((2 * HALF_TRAVEL_MM + 15.0) * k)  # hard safety limit
+    approach_period_us = int(1e6 / max(approach_sps, 1.0))
+    return_steps       = int(center_mm * k)
+
+    print("\n" + "═" * 56)
+    print("  PHASE 0 — AUTO-CENTERING")
+    print("═" * 56)
+    print(f"  STEP={step_pin}  DIR={dir_pin}  BUTTON={BUTTON_PIN}  "
+          f"ENA={ENABLE_PIN}")
+    print(f"  approach_dir={'+ ' if approach_dir > 0 else '- '}  "
+          f"approach_sps={approach_sps:.0f}  "
+          f"return_sps={return_sps:.0f}  "
+          f"center_mm={center_mm:.1f}")
+    print(f"  button active {'LOW' if active_low else 'HIGH'}")
+    print()
+
+    # ── GPIO setup ────────────────────────────────────────────────────────────
+    for pin in [step_pin, dir_pin, ENABLE_PIN]:
+        pi.set_mode(pin, pigpio.OUTPUT)
+        pi.write(pin, 0)
+
+    pi.set_mode(BUTTON_PIN, pigpio.INPUT)
+    pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
+
+    # Assert enable/interlock before moving
+    pi.write(ENABLE_PIN, 1)
+    time.sleep(0.05)
+
+    # ── Phase 1: approach wall ────────────────────────────────────────────────
+    if _ac_btn(pi, active_low):
+        print("  Button already pressed — skipping approach.")
+        steps_taken = 0
+    else:
+        print(f"  Creeping toward wall at {approach_sps:.0f} sps "
+              f"(dir={'+ ' if approach_dir > 0 else '- '}logical)...")
+
+        actual_dir = approach_dir * (-1 if dir_invert else 1)
+        pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+        time.sleep(AC_DIR_SETUP_US * 1e-6)
+        last_dir   = actual_dir
+        steps_taken = 0
+
+        for _ in range(MAX_APPROACH_STEPS):
+            if _ac_btn(pi, active_low):
+                break
+            last_dir = _ac_step_once(pi, step_pin, dir_pin,
+                                     approach_dir, dir_invert,
+                                     last_dir, approach_period_us)
+            steps_taken += 1
+        else:
+            print(f"  WARNING: hit step limit ({MAX_APPROACH_STEPS/k:.0f} mm) "
+                  "without triggering button.  Check wiring / active level.")
+            print("  Aborting — carriage position unknown.  "
+                  "Run with --no_autocenter if button is not connected.")
+            return
+
+        print(f"  Button triggered after {steps_taken} steps "
+              f"({steps_taken/k:.1f} mm travel).")
+
+    # Brief pause so carriage is fully at rest before reversing
+    time.sleep(0.25)
+
+    # ── Phase 2: back off to centre ────────────────────────────────────────────
+    return_dir = -approach_dir
+    print(f"  Backing off {center_mm:.1f} mm "
+          f"({return_steps} steps) at up to {return_sps:.0f} sps...")
+
+    actual_dir = return_dir * (-1 if dir_invert else 1)
+    pi.write(dir_pin, 1 if actual_dir > 0 else 0)
+    time.sleep(AC_DIR_SETUP_US * 1e-6)
+    last_dir = actual_dir
+
+    for i in range(return_steps):
+        # Bail if we unexpectedly hit the other wall (shouldn't happen)
+        if _ac_btn(pi, active_low) and i > 200:
+            print(f"  Button during back-off at step {i} — stopping early.")
+            break
+        period = _ac_period_us(i, return_steps, return_sps)
+        last_dir = _ac_step_once(pi, step_pin, dir_pin,
+                                  return_dir, dir_invert,
+                                  last_dir, period)
+
+    print("  Centred ✓")
+    print("\n  Starting identify phase in 1 s...")
+    time.sleep(1.0)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Argument parsing
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -202,6 +386,24 @@ def parse_args():
     hw.add_argument("--chunk_ms",        type=float, default=50.0)
     hw.add_argument("--dir_setup_us",    type=int,   default=20)
     hw.add_argument("--dir_blanking_us", type=int,   default=200)
+
+    # ── Auto-centering (Phase 0) ───────────────────────────────────────────────
+    ac = p.add_argument_group("Phase 0 — Auto-centering  (ON by default; "
+                               "skipped automatically in --simulate)")
+    ac.add_argument("--no_autocenter",     action="store_true",
+                    help="Skip auto-centering.  Carriage must already be near "
+                         "centre, or the travel safety may trip.")
+    ac.add_argument("--approach_sps",      type=float, default=1000.0,
+                    help="Step rate during wall approach [sps].")
+    ac.add_argument("--return_sps",        type=float, default=4000.0,
+                    help="Max step rate during back-off to centre [sps].")
+    ac.add_argument("--center_mm",         type=float, default=45.0,
+                    help="Distance to back off after touching wall [mm].  "
+                         "Should match distance from wall to mechanical centre.")
+    ac.add_argument("--approach_dir",      type=int,   default=-1, choices=[1, -1],
+                    help="Logical direction to approach wall (+1 or -1).")
+    ac.add_argument("--button_active_low", action="store_true",
+                    help="Button pin is active LOW (default: active HIGH).")
 
     # ── Phase 1: Identification ───────────────────────────────────────────────
     id_g = p.add_argument_group("Phase 1 — Identification")
@@ -1037,15 +1239,10 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     log_buf     = {'t': [], 'e': [], 'C': [], 'S': [], 'f': []}
 
     # ── Shared frequency state (single-writer invariant) ─────────────────────
-    # Writers:
-    #   • FFT tracker thread  if args.fft_tracker (sole writer)
-    #   • LMS thread          if not args.fft_tracker AND mu_omega > 0
-    # Reader: main loop at chunk boundary; LMS thread at each iteration
     freqs_shared = list(F_init)
     freqs_lock   = threading.Lock()
 
     # ── IMU ring buffer for the FFT tracker ──────────────────────────────────
-    # Sized for fft_window_sec at control_fs, plus a small margin for jitter.
     imu_buf_len  = int(args.fft_window_sec * args.control_fs * 1.5) + 100
     imu_buffer   = deque(maxlen=imu_buf_len)
     buffer_lock  = threading.Lock()
@@ -1058,6 +1255,8 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
             print(f"    Note: gradient ω update auto-disabled (FFT is sole writer)")
 
     # ── GPIO setup ────────────────────────────────────────────────────────────
+    # Note: if autocenter ran first, these pins are already configured.
+    # Re-applying set_mode is harmless and guarantees correct state.
     pi.set_mode(args.dir,   pigpio.OUTPUT)
     pi.set_mode(args.step,  pigpio.OUTPUT)
     pi.set_mode(ENABLE_PIN, pigpio.OUTPUT)
@@ -1114,7 +1313,6 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     t_end_wall = (t_wall_start + args.cancel_dur) if args.cancel_dur > 0 else None
 
     # Per-tone stepper phase accumulators — see compute_chunk docstring.
-    # Mutated in place by compute_chunk; persists across all chunk calls.
     step_phis  = [0.0] * n
 
     est_peak_sps = sum(
@@ -1150,11 +1348,6 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
     t_chunk_wall = time.monotonic()
 
     # ── Double-buffer main loop ───────────────────────────────────────────────
-    #
-    #   While chunk N plays via DMA, Python computes chunk N+1.
-    #   Once N finishes: delete N, add N+1, send N+1 immediately.
-    #   Only one waveform occupies the CB pool at a time.
-    #
     try:
         while True:
             if t_end_wall and time.monotonic() >= t_end_wall:
@@ -1189,8 +1382,6 @@ def run_cancellation(pi, tones, args, k, per_tone_max_amp):
                     f"exceeds ±{HALF_TRAVEL_MM}mm"
                 )
 
-            # Delete current waveform before adding next — keeps CB pool at
-            # single-waveform occupancy, preventing CB exhaustion at high sps.
             pi.wave_delete(wave_c)
             pi.wave_add_generic(pulses_n)
             wave_n = pi.wave_create()
@@ -1275,6 +1466,9 @@ def main():
 
     mu_omega = args.mu_omega if args.mu_omega is not None else args.mu * 0.01
 
+    # Autocenter is skipped automatically in simulate mode (no real GPIO)
+    autocenter_on = (not args.no_autocenter) and (not args.simulate)
+
     print("═" * 56)
     print("  VSS CONTROLLER  —  Adaptive Vibration Suppression")
     print("═" * 56)
@@ -1285,52 +1479,77 @@ def main():
     print(f"  µ          = {args.mu}")
     print(f"  µ_omega    = {mu_omega}  "
           f"({'tracking ON' if mu_omega > 0 else 'tracking OFF'})")
+    print(f"  autocenter = {'ON' if autocenter_on else 'OFF'}")
 
-    # ── Phase 1: Identify ─────────────────────────────────────────────────────
-    if args.skip_id:
-        if not args.manual_freqs:
-            sys.exit("ERROR: --skip_id requires at least one --manual_freqs value.")
-        if len(args.manual_freqs) > 3:
-            sys.exit("ERROR: at most 3 tones supported.")
-        tones = [(f, 0.0) for f in args.manual_freqs[:args.n_tones]]
-        print(f"\n  Skipping identification.  Manual tones: {args.manual_freqs}")
-    else:
-        tones = identify_disturbance(args)
-        if not tones:
-            sys.exit(
-                f"ERROR: no dominant tones found in "
-                f"[{args.min_freq}, {args.max_freq}] Hz.\n"
-                f"Try longer --id_dur, wider band, or --simulate."
-            )
-
-    # ── Compute per-tone amplitude limits ─────────────────────────────────────
-    #
-    #   Each tone's limit = min(--max_amp_per_tone, sps-safe limit for that f).
-    #   Computed independently per tone so a high-frequency tone's tighter sps
-    #   constraint does not reduce the limit for lower-frequency tones.
-    #   The global args.max_amp_per_tone is never mutated.
-    #
-    per_tone_max_amp = []
-    for f, _ in tones:
-        sps_at_max = args.max_amp_per_tone * 2 * math.pi * f * k
-        if sps_at_max > args.max_sps:
-            safe_amp = args.max_sps / (2 * math.pi * f * k) * 0.95
-            print(f"  WARNING: {f:.2f}Hz — amp limit for this tone set to "
-                  f"{safe_amp:.2f}mm  (sps constraint; other tones unaffected)")
-            per_tone_max_amp.append(safe_amp)
-        else:
-            per_tone_max_amp.append(args.max_amp_per_tone)
-
-    # ── Phase 2: Cancel ───────────────────────────────────────────────────────
-    pi = pigpio.pi()
-    if not pi.connected:
-        sys.exit("ERROR: pigpiod not running.  "
-                 "Start with:  sudo systemctl start pigpiod")
+    # ── Connect to pigpiod (needed by both autocenter and cancellation) ────────
+    pi = None
+    if not args.simulate:
+        pi = pigpio.pi()
+        if not pi.connected:
+            sys.exit("ERROR: pigpiod not running.  "
+                     "Start with:  sudo pigpiod -s 2 -b 4096")
 
     try:
-        run_cancellation(pi, tones, args, k, per_tone_max_amp)
+        # ── Phase 0: Auto-center ───────────────────────────────────────────────
+        if autocenter_on:
+            autocenter_vss(pi, args, k)
+
+        # ── Phase 1: Identify ──────────────────────────────────────────────────
+        if args.skip_id:
+            if not args.manual_freqs:
+                sys.exit("ERROR: --skip_id requires at least one --manual_freqs value.")
+            if len(args.manual_freqs) > 3:
+                sys.exit("ERROR: at most 3 tones supported.")
+            tones = [(f, 0.0) for f in args.manual_freqs[:args.n_tones]]
+            print(f"\n  Skipping identification.  Manual tones: {args.manual_freqs}")
+        else:
+            tones = identify_disturbance(args)
+            if not tones:
+                sys.exit(
+                    f"ERROR: no dominant tones found in "
+                    f"[{args.min_freq}, {args.max_freq}] Hz.\n"
+                    f"Try longer --id_dur, wider band, or --simulate."
+                )
+
+        # ── Compute per-tone amplitude limits ──────────────────────────────────
+        per_tone_max_amp = []
+        for f, _ in tones:
+            sps_at_max = args.max_amp_per_tone * 2 * math.pi * f * k
+            if sps_at_max > args.max_sps:
+                safe_amp = args.max_sps / (2 * math.pi * f * k) * 0.95
+                print(f"  WARNING: {f:.2f}Hz — amp limit for this tone set to "
+                      f"{safe_amp:.2f}mm  (sps constraint; other tones unaffected)")
+                per_tone_max_amp.append(safe_amp)
+            else:
+                per_tone_max_amp.append(args.max_amp_per_tone)
+
+        # ── Phase 2: Cancel ────────────────────────────────────────────────────
+        if args.simulate:
+            # Stub pigpio for simulation — no real GPIO
+            class _SimPi:
+                def wave_clear(self):          pass
+                def set_mode(self, *a):        pass
+                def write(self, *a):           pass
+                def wave_add_generic(self, *a): pass
+                def wave_create(self):         return 0
+                def wave_send_once(self, *a):  pass
+                def wave_tx_busy(self):        return False
+                def wave_delete(self, *a):     pass
+                def wave_tx_stop(self):        pass
+                def get_current_tick(self):    return 0
+                def stop(self):                pass
+            pi_run = _SimPi()
+        else:
+            pi_run = pi
+
+        run_cancellation(pi_run, tones, args, k, per_tone_max_amp)
+
     finally:
-        pi.stop()
+        if pi is not None:
+            try:
+                pi.stop()
+            except Exception:
+                pass
 
     print("Done.")
 
