@@ -413,7 +413,7 @@ def parse_args():
     ac.add_argument("--center_mm",         type=float, default=45.0,
                     help="Distance to back off after touching wall [mm].  "
                          "Should match distance from wall to mechanical centre.")
-    ac.add_argument("--approach_dir",      type=int,   default=-1, choices=[1, -1],
+    ac.add_argument("--approach_dir",      type=int,   default=1, choices=[1, -1],
                     help="Logical direction to approach wall (+1 or -1).")
     ac.add_argument("--button_active_low", action="store_true",
                     help="Button pin is active LOW (default: active HIGH).")
