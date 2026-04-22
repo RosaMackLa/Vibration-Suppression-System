@@ -406,7 +406,7 @@ def parse_args():
     ac.add_argument("--no_autocenter",     action="store_true",
                     help="Skip auto-centering.  Carriage must already be near "
                          "centre, or the travel safety may trip.")
-    ac.add_argument("--approach_sps",      type=float, default=1000.0,
+    ac.add_argument("--approach_sps",      type=float, default=3000.0,
                     help="Step rate during wall approach [sps].")
     ac.add_argument("--return_sps",        type=float, default=4000.0,
                     help="Max step rate during back-off to centre [sps].")
